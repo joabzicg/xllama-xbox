@@ -20,6 +20,8 @@
     #include "inference-bridge.h"
     #include "model-downloader.h"
     #include "xllama/chat_prompt.h"
+    #include "xllama/kv_continuation.h"
+    #include "xllama/sse.h"
     #include "xllama/model_provision.h"
     #include "xllama/path_utils.h"
     #include "xllama/personalize.h"
@@ -32,7 +34,9 @@
     #include "xllama/utf8_utils.h"
 
     #include <algorithm>
+    #include <atomic>
     #include <cctype>
+    #include <thread>
     #include <cstdio>
     #include <ctime>
     #include <filesystem>
@@ -240,6 +244,18 @@ void write_cors_preflight(StreamSocket const& socket) {
                       "Content-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
+// Read an optional boolean field (default false). WinRT Json has no cheap
+// "get bool or default", and a missing key throws on GetNamedBoolean.
+bool json_bool(JsonObject const& root, const wchar_t* key) {
+    if (!root.HasKey(key))
+        return false;
+    try {
+        return root.GetNamedBoolean(key, false);
+    } catch (...) {
+        return false;
+    }
+}
+
 std::string error_json(const std::string& msg) {
     JsonObject err;
     err.Insert(L"message", JsonValue::CreateStringValue(winrt::to_hstring(msg)));
@@ -313,127 +329,228 @@ void split_messages(JsonArray const& messages, std::string& system,
         final_user = cur_user; // trailing user turn is the one we answer
 }
 
-// Handles one chat request under session_hub().mtx (already locked by the caller).
-std::string handle_chat_locked(const std::string& body, const char*& status) {
+// ---------------------------------------------------------------------------
+// Shared request preparation + safe KV-prefix reuse
+//
+// Both the non-streaming and streaming responses parse the body, resolve the
+// model/Session, apply the same prompt budget and sampling params, and make the
+// KV-reuse decision through ONE path (prepare_chat) so the two cannot drift.
+// ---------------------------------------------------------------------------
+
+// Params that invalidate KV reuse — EXACTLY Session::sampling_matches()'s set
+// (temperature/top_p/top_k/repetition_penalty). A change here makes the Session
+// rebuild its persistent generator, so we must NOT claim a continuation.
+std::string params_fingerprint(const ::xllama::GenerateParams& gp) {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "t=%g|p=%g|k=%d|r=%g", static_cast<double>(gp.temperature),
+                  static_cast<double>(gp.top_p), gp.top_k, static_cast<double>(gp.repetition_penalty));
+    return buf;
+}
+
+// Per-conversation KV memory for the LAN API. Guarded by session_hub().mtx (the
+// single-slot lock the caller already holds). `primed_generation` records the
+// hub generation at which we last primed a persistent generator; if it no longer
+// matches, another surface swapped the resident model and the KV is gone — force
+// a full prefill (never reuse across a swap).
+struct ApiKvMemory {
+    ::xllama::kv::ConvState prev;
+    uint64_t primed_generation = 0;
+    bool valid = false;          // a prior API turn primed KV on the current generation
+    bool prev_ended_with_stop = false; // render_delta() needs the previous turn's verdict
+};
+ApiKvMemory g_kv_memory;
+
+// Everything both response paths need, parsed once.
+struct ChatPrep {
+    std::string model;
+    std::string system;
+    std::string final_user;
+    std::vector<::xllama::ChatTurn> history;
+    ::xllama::Session* session = nullptr;
+    ::xllama::ChatFormat fmt;
+    ::xllama::GenerateParams gp;
+    // KV decision resolved in prepare_chat:
+    bool kv_reuse = false;   // -> reuse_kv
+    bool kv_reset = true;    // -> reset_kv
+    std::string prompt_for_generate; // delta on reuse, full prompt otherwise
+    ::xllama::kv::ConvState kv_cur;  // snapshot for commit_kv after generation
+};
+
+// Returns true on success (prep filled); on failure sets *status and returns the
+// error JSON body in *err. Must be called with session_hub().mtx held.
+bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std::string& err) {
     JsonObject root{nullptr};
     if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
         status = "400 Bad Request";
-        return error_json("invalid JSON body");
+        err = error_json("invalid JSON body");
+        return false;
     }
 
-    std::string model = winrt::to_string(root.GetNamedString(L"model", L""));
-    if (model.empty())
-        model = read_local_text("model.txt"); // field-test fallback
-    if (model.empty()) {
+    p.model = winrt::to_string(root.GetNamedString(L"model", L""));
+    if (p.model.empty())
+        p.model = read_local_text("model.txt"); // field-test fallback
+    if (p.model.empty()) {
         status = "400 Bad Request";
-        return error_json("missing 'model' (and no LocalState\\model.txt fallback)");
+        err = error_json("missing 'model' (and no LocalState\\model.txt fallback)");
+        return false;
     }
 
     if (!root.HasKey(L"messages") ||
         root.GetNamedValue(L"messages").ValueType() != JsonValueType::Array) {
         status = "400 Bad Request";
-        return error_json("missing or non-array 'messages'");
+        err = error_json("missing or non-array 'messages'");
+        return false;
     }
-    std::string system, final_user;
-    std::vector<::xllama::ChatTurn> history;
-    split_messages(root.GetNamedArray(L"messages"), system, history, final_user);
-    if (final_user.empty()) {
+    split_messages(root.GetNamedArray(L"messages"), p.system, p.history, p.final_user);
+    if (p.final_user.empty()) {
         status = "400 Bad Request";
-        return error_json("no user message to complete");
+        err = error_json("no user message to complete");
+        return false;
     }
-    // Lazily (re)create the resident Session when the requested model differs
-    // (hub.mtx is held by the caller; the swap invalidates the GUI's KV-reuse
-    // state via hub.generation, which its next turn detects). Catalogue n_ctx
-    // / role (coding) apply the same policy as the chat UI.
-    ::xllama::Session* session = nullptr;
+
     bool model_is_coding = false;
     int policy_n_ctx = ::xllama::kDefaultNCtx;
     {
-        std::string err;
-        const CatalogueSessionPolicy policy = catalogue_session_policy(model);
+        std::string serr;
+        const CatalogueSessionPolicy policy = catalogue_session_policy(p.model);
         model_is_coding = policy.coding;
         policy_n_ctx = policy.n_ctx;
         ::xllama::SessionParams sp;
-        sp.model_path = model;
+        sp.model_path = p.model;
         sp.n_ctx = policy.n_ctx;
         if (policy.gguf)
             sp.backend = ::xllama::Backend::LlamaCpp;
-        session = ::xllama::session_hub().ensure_locked(model, sp, &err);
-        if (!session) {
+        p.session = ::xllama::session_hub().ensure_locked(p.model, sp, &serr);
+        if (!p.session) {
             status = "500 Internal Server Error";
-            return error_json("session create failed: " + err);
+            err = error_json("session create failed: " + serr);
+            return false;
         }
     }
 
-    // Small instruct models degrade badly with an empty system turn (they
-    // hallucinate the next role instead of answering); the chat UI always seeds
-    // one. Match it when the client sends no system message — coding models get
-    // the coding default so a bare LAN client does not look like general chat.
-    if (system.empty())
-        system = model_is_coding ? ::xllama::kCodingSystemPrompt : ::xllama::kDefaultSystemPrompt;
+    if (p.system.empty())
+        p.system = model_is_coding ? ::xllama::kCodingSystemPrompt : ::xllama::kDefaultSystemPrompt;
 
-    const ::xllama::ChatFormat fmt = ::xllama::chat_format_for(model);
-    ::xllama::GenerateParams gp;
-    gp.stop_sequences = fmt.stop_sequences;
-    gp.reuse_kv = false; // OpenAI chat is stateless: messages[] carry full history
-    // max_tokens is deprecated in favour of max_completion_tokens; accept both.
-    // Parsed BEFORE the prompt is built: the budget below needs to know how much
-    // room the reply asks for.
-    gp.n_predict = 512;
+    p.fmt = ::xllama::chat_format_for(p.model);
+    p.gp.stop_sequences = p.fmt.stop_sequences;
+    p.gp.n_predict = 512;
     if (root.HasKey(L"max_completion_tokens"))
-        gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_completion_tokens"));
+        p.gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_completion_tokens"));
     else if (root.HasKey(L"max_tokens"))
-        gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_tokens"));
+        p.gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_tokens"));
 
-    // Same budget as the chat UI, same primitive, same tokenizer: the oldest
-    // messages[] entries are dropped until the prompt plus the requested reply fit
-    // n_ctx (xllama::fit_prompt). Before this, a long conversation reached
-    // Session::generate and came back as a 500 — a client error reported as a
-    // server one, and only after paying the tokenization.
+    // Prompt budget (same primitive as the chat UI). `fit.dropped > 0` marks that
+    // we had to trim — which invalidates any KV prefix from a prior turn.
+    bool trimmed = false;
+    std::string full_prompt;
     {
         const ::xllama::PromptFit fit = ::xllama::fit_prompt(
-            fmt, system, history, final_user, policy_n_ctx, gp.n_predict,
-            [session](const std::string& text) { return session->count_tokens(text); });
+            p.fmt, p.system, p.history, p.final_user, policy_n_ctx, p.gp.n_predict,
+            [session = p.session](const std::string& text) { return session->count_tokens(text); });
         if (!fit.fits) {
-            // Nothing older left to drop: the final user message alone does not fit.
-            // That is the client's input, hence 400.
             status = "400 Bad Request";
-            return error_json("prompt too long: the final user message needs " +
+            err = error_json("prompt too long: the final user message needs " +
                               std::to_string(fit.n_tokens) + " tokens plus " +
-                              std::to_string(gp.n_predict) + " for the reply, but n_ctx is " +
+                              std::to_string(p.gp.n_predict) + " for the reply, but n_ctx is " +
                               std::to_string(policy_n_ctx));
+            return false;
         }
-        if (fit.dropped > 0)
+        if (fit.dropped > 0) {
+            trimmed = true;
             ::xllama::log_output("[xllama] api: dropped " + std::to_string(fit.dropped) +
                                  " oldest message(s) to fit n_ctx " + std::to_string(policy_n_ctx) +
                                  "\n");
-        gp.prompt = fit.prompt;
+        }
+        full_prompt = fit.prompt;
     }
+
     if (root.HasKey(L"temperature"))
-        gp.temperature = static_cast<float>(root.GetNamedNumber(L"temperature"));
+        p.gp.temperature = static_cast<float>(root.GetNamedNumber(L"temperature"));
     if (root.HasKey(L"top_p"))
-        gp.top_p = static_cast<float>(root.GetNamedNumber(L"top_p"));
-    if (root.HasKey(L"seed")) // reproducibility for a research endpoint
-        gp.seed = static_cast<uint32_t>(root.GetNamedNumber(L"seed", -1.0));
-    // Client-supplied stop: a string or an array of strings, added to the
-    // format's own stops so clients can bound output.
+        p.gp.top_p = static_cast<float>(root.GetNamedNumber(L"top_p"));
+    if (root.HasKey(L"seed"))
+        p.gp.seed = static_cast<uint32_t>(root.GetNamedNumber(L"seed", -1.0));
     if (root.HasKey(L"stop")) {
         const auto sv = root.GetNamedValue(L"stop");
         if (sv.ValueType() == JsonValueType::String) {
-            gp.stop_sequences.push_back(winrt::to_string(sv.GetString()));
+            p.gp.stop_sequences.push_back(winrt::to_string(sv.GetString()));
         } else if (sv.ValueType() == JsonValueType::Array) {
             for (auto&& e : sv.GetArray())
                 if (e.ValueType() == JsonValueType::String)
-                    gp.stop_sequences.push_back(winrt::to_string(e.GetString()));
+                    p.gp.stop_sequences.push_back(winrt::to_string(e.GetString()));
         }
     }
 
-    const ::xllama::InferenceResult r = session->generate(gp);
+    // ---- KV-reuse decision (guarded by hub.mtx, held by caller) ----
+    // A model swap bumps hub.generation; if it moved since we primed, the resident
+    // session is a different one and any remembered prefix is stale.
+    const bool primed_on_this_generation = g_kv_memory.valid && g_kv_memory.primed_generation ==
+                                                                                   ::xllama::session_hub().generation;
+    ::xllama::kv::ConvState cur;
+    cur.model = p.model;
+    cur.system = p.system;
+    cur.params_fp = params_fingerprint(p.gp);
+    cur.history = p.history;
+    cur.final_user = p.final_user;
+    cur.trimmed = trimmed;
+    cur.primed = primed_on_this_generation;
+    const ::xllama::kv::Decision decision = ::xllama::kv::decide(g_kv_memory.prev, cur);
+
+    if (decision.reuse) {
+        // Continuation: send only the new turn's delta onto the persistent KV.
+        p.kv_reuse = true;
+        p.kv_reset = false;
+        p.prompt_for_generate = p.fmt.render_delta(p.final_user, g_kv_memory.prev_ended_with_stop);
+        p.gp.n_keep = p.session->count_tokens(p.fmt.render_system_prefix(p.system));
+    } else {
+        // Full prefill: prime a persistent generator so the NEXT turn can reuse.
+        p.kv_reuse = true;
+        p.kv_reset = true;
+        p.prompt_for_generate = full_prompt;
+        p.gp.n_keep = 0;
+    }
+    p.gp.reuse_kv = p.kv_reuse;
+    p.gp.reset_kv = p.kv_reset;
+    p.gp.prompt = p.prompt_for_generate;
+    // Stash the current conversation snapshot so the response path can commit it
+    // after generation (needs the assistant output + ended_with_stop).
+    p.kv_cur = cur;
+    return true;
+}
+
+// Commit KV memory after a successful turn: fold this exchange into history and
+// record that the persistent generator is primed on the CURRENT hub generation.
+void commit_kv(const ChatPrep& p, const std::string& assistant_output, bool ended_with_stop) {
+    ::xllama::kv::ConvState& prev = g_kv_memory.prev;
+    prev.model = p.model;
+    prev.system = p.system;
+    prev.params_fp = params_fingerprint(p.gp);
+    prev.history = p.history;
+    prev.history.push_back({p.final_user, assistant_output});
+    prev.final_user.clear(); // nothing pending between turns
+    prev.trimmed = false;
+    prev.primed = true;
+    g_kv_memory.primed_generation = ::xllama::session_hub().generation;
+    g_kv_memory.valid = true;
+    g_kv_memory.prev_ended_with_stop = ended_with_stop;
+}
+
+// Handles one chat request under session_hub().mtx (already locked by the caller).
+// Non-streaming path: parse+prepare, generate to completion, build the OpenAI
+// chat.completion JSON (byte-identical to the pre-streaming response), commit KV.
+std::string handle_chat_locked(const std::string& body, const char*& status) {
+    ChatPrep p;
+    std::string err;
+    if (!prepare_chat(body, p, status, err))
+        return err;
+
+    const ::xllama::InferenceResult r = p.session->generate(p.gp);
     if (!r.success) {
         status = "500 Internal Server Error";
         return error_json("generation failed: " + r.error_msg);
     }
-    const std::string content = fmt.postprocess_output(r.output_text);
+    const std::string content = p.fmt.postprocess_output(r.output_text);
+    commit_kv(p, content, r.ended_with_stop);
 
     JsonObject message;
     message.Insert(L"role", JsonValue::CreateStringValue(L"assistant"));
@@ -447,7 +564,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status) {
     // "length" only when we actually hit the token cap; a model that ends on its
     // EOS token before the cap stops naturally, which ended_with_stop (a textual
     // stop-sequence match) does not capture — deduce it from the token count.
-    const bool hit_cap = r.n_eval >= gp.n_predict;
+    const bool hit_cap = r.n_eval >= p.gp.n_predict;
     choice.Insert(L"finish_reason", JsonValue::CreateStringValue(hit_cap ? L"length" : L"stop"));
     JsonArray choices;
     choices.Append(choice);
@@ -464,11 +581,124 @@ std::string handle_chat_locked(const std::string& body, const char*& status) {
     resp.Insert(L"id", JsonValue::CreateStringValue(winrt::to_hstring(id)));
     resp.Insert(L"object", JsonValue::CreateStringValue(L"chat.completion"));
     resp.Insert(L"created", JsonValue::CreateNumberValue(static_cast<double>(time(nullptr))));
-    resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(model)));
+    resp.Insert(L"model", JsonValue::CreateStringValue(winrt::to_hstring(p.model)));
     resp.Insert(L"choices", choices);
     resp.Insert(L"usage", usage);
     status = "200 OK";
     return winrt::to_string(resp.Stringify());
+}
+
+// Streaming path (stream:true). Standards-compatible OpenAI SSE: role chunk first,
+// then one content chunk per generated piece, a final finish_reason chunk, then
+// data:[DONE]. HTTP/1.1 chunked framing, no Content-Length, CORS preserved.
+//
+// THREADING (the whole point of this path):
+//   * This function runs on the WinRT ConnectionReceived thread-pool callback — an
+//     MTA thread. It is the WRITER execution context: the single DataWriter for the
+//     whole response is created, used (StoreAsync/FlushAsync), and destroyed HERE,
+//     and nowhere else. No DataWriter is ever created per token.
+//   * Generation runs on a SEPARATE std::thread (the PRODUCER). Its on_token copies
+//     the string_view immediately and ENQUEUES into SseStreamSession; it never calls
+//     StoreAsync/FlushAsync/touches the socket. So the decode thread NEVER waits on
+//     LAN I/O — it only touches a mutex-protected bounded queue.
+//   * The producer thread does no WinRT work, so it needs no apartment of its own;
+//     we still init MTA defensively (cheap, and unquestionably valid under UWP).
+//   * Shutdown is unconditional: an RAII guard closes the session on EVERY exit
+//     path (success, generation throw, socket failure), waking the drain loop so it
+//     can never wait for a finish() that some error path skipped. The producer
+//     thread is joined before return.
+void handle_chat_streaming(StreamSocket const& socket, const std::string& body) {
+    ChatPrep p;
+    const char* status = "200 OK";
+    std::string err;
+    if (!prepare_chat(body, p, status, err)) {
+        write_response(socket, status, err); // error before any SSE bytes: plain JSON
+        return;
+    }
+
+    // ---- Writer context (this thread owns the DataWriter for its whole life) ----
+    DataWriter writer(socket.OutputStream());
+    writer.UnicodeEncoding(UnicodeEncoding::Utf8);
+    try {
+        socket.Control().NoDelay(true); // push small frames promptly; no Nagle delay
+    } catch (...) {
+    }
+    bool alive = true;
+    auto write_raw = [&](const std::string& s) { // ONLY ever called on this thread
+        if (!alive)
+            return;
+        try {
+            writer.WriteString(winrt::to_hstring(s));
+            writer.StoreAsync().get(); // WinRT await — writer thread only
+            writer.FlushAsync().get();
+        } catch (...) {
+            alive = false; // client gone -> sink failure -> session sets abort_flag
+        }
+    };
+    auto sink = [&](const std::string& framed) { write_raw(framed); return alive; };
+
+    const std::string id =
+        "chatcmpl-xllama-" + std::to_string(time(nullptr)) + "-" + std::to_string(++g_req_counter);
+    const long long created = static_cast<long long>(time(nullptr));
+
+    // SSE response headers first (writer thread, before any event).
+    write_raw(::xllama::sse::sse_response_headers());
+    if (!alive)
+        return;
+
+    ::xllama::sse::SseStreamSession session(id, p.model, created, p.gp.stop_sequences,
+                                            std::move(sink));
+    ::xllama::sse::SseCloseGuard guard(session); // unconditional close on every exit path
+    p.gp.abort_flag = session.abort_flag();      // decode loop checks this every iteration
+    p.gp.on_token = [&](std::string_view piece) { // PRODUCER: enqueue only, never touch socket
+        session.on_token(piece);
+    };
+
+    // Role-first event (enqueued; the drain loop writes it first).
+    session.emit_role_first();
+
+    // ---- Producer thread: generation runs here; on_token enqueues to the session ----
+    ::xllama::InferenceResult r;
+    bool gen_ok = false;
+    std::thread producer([&]() {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded); // defensive; no WinRT calls here
+        try {
+            r = p.session->generate(p.gp);
+            gen_ok = r.success && !session.abort_flag()->load();
+            if (gen_ok)
+                session.finish(r.ended_with_stop); // flush tail + finish_reason + [DONE] + close
+            else
+                session.close(); // generation failed/aborted: wake the drain loop
+        } catch (...) {
+            session.close(); // never leave the drain loop waiting on a skipped finish()
+        }
+    });
+
+    // ---- Writer drains concurrently (the ONLY place StoreAsync/FlushAsync run) ----
+    std::string frame;
+    while (session.drain_one_blocking(frame))
+        write_raw(frame); // sink runs here, on the writer thread
+
+    producer.join(); // generation thread must finish before we tear down
+    try {
+        writer.DetachStream();
+    } catch (...) {
+    }
+
+    // Commit KV only on a clean completion; an abort/disconnect leaves a partial turn,
+    // so force a full prefill next time rather than a corrupt continuation.
+    if (gen_ok)
+        commit_kv(p, p.fmt.postprocess_output(r.output_text), r.ended_with_stop);
+    else
+        g_kv_memory.valid = false;
+}
+
+// True when the request body asks for streaming ("stream": true).
+bool body_wants_stream(const std::string& body) {
+    JsonObject root{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr)
+        return false;
+    return json_bool(root, L"stream");
 }
 
 // The single model the server can currently serve: the resident one, else the
@@ -806,9 +1036,24 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                 write_response(socket, "503 Service Unavailable", error_json("server stopped"));
                 return;
             }
-            // handle_chat_locked touches WinRT JSON accessors that throw on
-            // wrong-typed fields; guarantee the client always gets a response
-            // rather than a silently dropped socket.
+            // Streaming: SSE on the same socket (no Content-Length). Errors before
+            // any SSE bytes are still plain JSON. handle_chat_locked touches WinRT
+            // JSON accessors that throw on wrong-typed fields; guarantee the client
+            // always gets a response rather than a silently dropped socket.
+            if (body_wants_stream(req.body)) {
+                try {
+                    handle_chat_streaming(socket, req.body);
+                } catch (winrt::hresult_error const& e) {
+                    char buf[256];
+                    snprintf(buf, sizeof(buf), "[xllama] api: stream hresult 0x%08X\n",
+                             static_cast<unsigned>(e.code().value));
+                    ::xllama::log_output(buf);
+                } catch (const std::exception& e) {
+                    ::xllama::log_output(std::string("[xllama] api: stream error: ") + e.what() +
+                                        "\n");
+                }
+                return;
+            }
             const char* status = "200 OK";
             std::string json;
             try {
