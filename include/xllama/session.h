@@ -151,6 +151,29 @@ struct Session {
     // Both return false with *err on any failure, "unsupported backend"
     // included; a caller must treat that as "no cache, prefill normally",
     // never as a hard error.
+    // Multimodal seam: the llama.cpp backend exposes its loaded handles so an
+    // mtmd context can be opened on top (mtmd requires a llama_model*; the ORT
+    // backend returns null → vision unsupported on that backend). Returned as void*
+    // so this header need not pull in llama.h. Callers cast back under XLLAMA_HAS_MTMD.
+    virtual void* llama_model_ptr() { return nullptr; }
+    virtual void* llama_context_ptr() { return nullptr; }
+
+    // Continue generation from the CURRENT KV end WITHOUT re-tokenizing/re-prefilling
+    // gp.prompt. The multimodal caller has ALREADY evaluated the templated text + image
+    // embeddings into this context (mtmd_helper_eval_chunks advanced n_past), so calling
+    // generate() here would decode the prompt a SECOND time and re-tokenize the media
+    // marker as plain text — double evaluation + position corruption. This runs only the
+    // sampler + decode loop, sampling from the logits the last eval left. Default =
+    // unsupported (non-llama backends). Not used by text-only turns; those keep generate().
+    virtual InferenceResult generate_from_prefilled(const GenerateParams& gp) {
+        (void)gp;
+        InferenceResult r;
+        r.error_msg = "prefill-continue not supported by this backend";
+        return r;
+    }
+    // Path to the model's mmproj GGUF (empty → no vision). llama.cpp backend only.
+    virtual std::string mmproj_path() const { return {}; }
+
     virtual bool save_state(const std::string& path, std::string* err = nullptr) {
         (void)path;
         if (err)

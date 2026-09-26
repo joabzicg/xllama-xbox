@@ -460,6 +460,12 @@ class LlamaSession final : public Session {
           m_n_ctx(n_ctx), m_n_threads(n_threads), m_n_batch(n_batch), m_n_ubatch(n_ubatch),
           m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup) {}
 
+    // Multimodal seam (see Session base). llama.cpp backend exposes its handles so an
+    // mtmd context opens on the SAME loaded model; the persistent KV lives in m_ctx, so
+    // vision prefill + text decode share one context (no second session resident).
+    void* llama_model_ptr() override { return m_model.get(); }
+    void* llama_context_ptr() override { return m_ctx.get(); }
+
     // Lazy context creation, shared by generate() and the state-file entry
     // points (#170b needs a context before the first turn). Returns false and
     // sets *err on failure; m_ctx stays null.
@@ -807,6 +813,66 @@ class LlamaSession final : public Session {
                  dlr.n_drafted, dlr.n_accepted);
         log_output(log_buf);
 
+        return res;
+    }
+
+    // Multimodal continue-from-prefilled. mtmd already ran llama_decode over the text
+    // chunks + image embeddings and advanced n_past; re-running generate() would decode
+    // the prompt AGAIN and re-tokenize the media marker as plain text. So this skips
+    // tokenization/prefill entirely and runs ONLY the sampler + decode loop, sampling
+    // from the logits the last eval left (decode_loop samples first — it never prefills).
+    // prompt-lookup is disabled for this call: mtmd's image-token positions are not
+    // enumerable as text ids, so the n-gram history would be wrong across the media
+    // boundary; m_kv_tokens is cleared after so no later turn prefix-matches a KV whose
+    // text record we cannot reconstruct (the API already forces a full re-prefill whenever
+    // images are present, so this only guards the mixed case).
+    InferenceResult generate_from_prefilled(const GenerateParams& gp) override {
+        InferenceResult res;
+        if (!ensure_ctx(&res.error_msg))
+            return res;
+        llama_context* ctx = m_ctx.get();
+        const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
+        llama_memory_t mem = llama_get_memory(ctx);
+        // Where mtmd left the cache. seq_pos_max is -1 on an empty cache → 0.
+        const int kv_len = static_cast<int>(llama_memory_seq_pos_max(mem, 0)) + 1;
+        if (kv_len <= 0) {
+            res.error_msg = "prefill-continue called with an empty context";
+            return res;
+        }
+        const SamplingConfig sc = gp.sampling();
+        if (!m_sampler || !same_chain(m_sampler_cfg, sc)) {
+            const llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
+            m_sampler.reset(llama_sampler_chain_init(sparams));
+            add_sampler_stages(m_sampler.get(), sc, vocab);
+            m_sampler_cfg = sc;
+        }
+        DecodeLoopParams dlp;
+        dlp.ctx = ctx;
+        dlp.sampler = m_sampler.get();
+        dlp.vocab = vocab;
+        dlp.n_predict = std::max(0, std::min(gp.n_predict, m_n_ctx - kv_len)); // n_pf == 0
+        dlp.stop_sequences = &gp.stop_sequences;
+        dlp.abort_flag = gp.abort_flag;
+        dlp.on_token = gp.on_token;
+        dlp.on_accepted = nullptr;      // image-token positions not enumerable as text ids
+        dlp.prompt_lookup = false;      // no reliable n-gram history across the media boundary
+        const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+        res.n_eval = dlr.n_generated;
+        res.ended_with_stop = dlr.ended_with_stop;
+        res.n_drafted = dlr.n_drafted;
+        res.n_spec_accepted = dlr.n_accepted;
+        if (dlr.rewind_failed) {
+            m_kv_tokens.clear();
+            llama_memory_clear(mem, /*data=*/true);
+            res.success = false;
+            res.error_msg = "speculative KV rewind unsupported (disable prompt_lookup)";
+            return res;
+        }
+        // Text-token record cannot span the image boundary; force a clean full re-prefill
+        // next turn rather than prefix-matching against an incomplete record.
+        m_kv_tokens.clear();
+        res.success = true;
+        log_output("[xllama] session generate: multimodal continue-from-prefilled (no re-prefill)\n");
         return res;
     }
 

@@ -174,6 +174,11 @@ static void test_kv_continuation() {
     CHECK(decide(prev,{"m","sys","fp1",{{"u1","a1"}},"u2",true,true}).reason=="prompt-trimmed");
     ConvState notprimed{"m","sys","fp1",{},"",false,false};
     CHECK(decide(notprimed,{"m","sys","fp1",{},"u2",false,true}).reason=="first-turn");
+    // Multimodal: reuse only when the exact media fingerprint matches; any change resets.
+    ConvState prev_img{"m","sys","fp1",{{"u1","a1"}},"",false,true,"FNVIMG1"};
+    CHECK(decide(prev_img,{"m","sys","fp1",{{"u1","a1"}},"u2",false,true,"FNVIMG1"}).reason=="continuation"); // same image -> reuse
+    CHECK(decide(prev_img,{"m","sys","fp1",{{"u1","a1"}},"u2",false,true,"FNVIMG2"}).reason=="images-changed"); // changed image -> reset
+    CHECK(decide(prev_img,{"m","sys","fp1",{{"u1","a1"}},"u2",false,true,""}).reason=="images-changed");      // image removed -> reset
 }
 
 int main(){

@@ -21,6 +21,8 @@
     #include "model-downloader.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/kv_continuation.h"
+    #include "xllama/vision.h"
+    #include "vision_mtmd.h"
     #include "xllama/sse.h"
     #include "xllama/model_provision.h"
     #include "xllama/path_utils.h"
@@ -301,14 +303,84 @@ CatalogueSessionPolicy catalogue_session_policy(const std::string& model) {
 }
 
 // Turn the OpenAI messages[] into (system, history, final_user) for render_prompt.
+// Parse one message's content into ORDERED parts (text/image in original order).
+// Image parts are decoded via the pure vision core: data URLs -> compressed bytes +
+// magic-byte MIME; unsupported/undecodable parts are dropped. Size limits are checked
+// BEFORE base64 allocation (Xbox OOM guard). Text-only messages yield a single text part.
+std::vector<::xllama::vision::Part> parse_content_parts(JsonValue const& content_val,
+                                                         size_t& total_image_bytes) {
+    std::vector<::xllama::vision::Part> parts;
+    if (content_val.ValueType() == JsonValueType::String) { // plain string content
+        ::xllama::vision::Part p;
+        p.kind = ::xllama::vision::Kind::Text;
+        p.text = winrt::to_string(content_val.GetString());
+        parts.push_back(std::move(p));
+        return parts;
+    }
+    if (content_val.ValueType() != JsonValueType::Array)
+        return parts;
+    for (auto&& el : content_val.GetArray()) {
+        if (el.ValueType() != JsonValueType::Object)
+            continue;
+        JsonObject part = el.GetObject();
+        const std::string type = winrt::to_string(part.GetNamedString(L"type", L""));
+        if (type == "text") {
+            ::xllama::vision::Part p;
+            p.kind = ::xllama::vision::Kind::Text;
+            p.text = winrt::to_string(part.GetNamedString(L"text", L""));
+            parts.push_back(std::move(p));
+        } else if (type == "image_url") {
+            JsonObject iu = part.HasKey(L"image_url") ? part.GetNamedObject(L"image_url") : JsonObject{nullptr};
+            if (!iu)
+                continue;
+            const std::string url = winrt::to_string(iu.GetNamedString(L"url", L""));
+            ::xllama::vision::Part p;
+            p.kind = ::xllama::vision::Kind::Image;
+            p.url = url;
+            // Data URLs decoded here (required path). Enforce size limits BEFORE alloc:
+            // bound the encoded payload, then verify magic bytes after decode.
+            if (::xllama::vision::parse_data_url(url, p.bytes, p.mime)) {
+                if (!::xllama::vision::mime_supported(p.mime) || !::xllama::vision::size_ok(total_image_bytes, p.bytes.size()))
+                    continue; // unsupported MIME / over budget -> drop
+                total_image_bytes += p.bytes.size();
+            } else if (::xllama::vision::is_http_url(url)) {
+                // Remote http(s)/file URL: OPTIONAL path. No network-fetch subsystem is
+                // added here (would complicate UWP); the URL is carried for a caller that
+                // can fetch, but with no bytes it cannot be encoded -> dropped from bitmaps.
+                continue;
+            } else {
+                continue; // undecodable
+            }
+            parts.push_back(std::move(p));
+        }
+    }
+    return parts;
+}
+
+// Turn the OpenAI messages[] into (system, history, final_user) for render_prompt,
+// PRESERVING multimodal order: each message's content is rendered with the media marker
+// in each image's exact position, and every decodable bitmap is appended to `images` in
+// that same global order (mtmd substitutes the i-th bitmap at the i-th marker). Text-only
+// messages produce no markers -> byte-identical fast path.
 void split_messages(JsonArray const& messages, std::string& system,
-                    std::vector<::xllama::ChatTurn>& history, std::string& final_user) {
+                    std::vector<::xllama::ChatTurn>& history, std::string& final_user,
+                    std::vector<::xllama::vision::Part>& images) {
+    size_t total_image_bytes = 0;
+    auto render_role = [&](JsonValue const& c) -> std::string {
+        auto parts = parse_content_parts(c, total_image_bytes);
+        ::xllama::vision::RenderedMessage r = ::xllama::vision::render_ordered("", parts);
+        for (auto* b : r.bitmaps)
+            images.push_back(*b); // ordered; index matches marker order
+        return r.text_with_markers;
+    };
     std::string cur_user;
     bool have_user = false;
     for (uint32_t i = 0; i < messages.Size(); ++i) {
         const JsonObject m = messages.GetObjectAt(i);
         const std::string role = winrt::to_string(m.GetNamedString(L"role", L""));
-        const std::string content = winrt::to_string(m.GetNamedString(L"content", L""));
+        if (!m.HasKey(L"content"))
+            continue;
+        const std::string content = render_role(m.GetNamedValue(L"content"));
         if (role == "system") {
             if (!system.empty())
                 system += "\n";
@@ -336,6 +408,53 @@ void split_messages(JsonArray const& messages, std::string& system,
 // model/Session, apply the same prompt budget and sampling params, and make the
 // KV-reuse decision through ONE path (prepare_chat) so the two cannot drift.
 // ---------------------------------------------------------------------------
+
+// Ordered FNV-1a fingerprint of every decodable image's bytes (identity for KV
+// invalidation). Empty when there are no images. Order matters: it is the media prefix.
+std::string image_fingerprint(const std::vector<::xllama::vision::Part>& images) {
+    std::string fp;
+    for (const auto& p : images)
+        if (!p.bytes.empty()) { fp += std::to_string(::xllama::vision::fnv1a(p.bytes)); fp += ':'; }
+    return fp;
+}
+
+// Vision prefill hook. NO-OP (returns true) when the request has no images, so the
+// text-only path is byte-identical to before. When images ARE present: with mtmd linked,
+// open/reuse an mtmd context on the resident Session's llama_model and prefill the
+// ordered text+markers + bitmaps into its shared KV (Fast/Detailed preset bounds); without
+// mtmd, return a clean error so behaviour is safe and explicit. Vision forces full prefill
+// upstream (KV image-fingerprint guard), so there is no reused-KV/marker interaction.
+bool apply_vision_prefill(ChatPrep& p, const char*& status, std::string& err) {
+    if (!p.had_images)
+        return true; // text-only fast path — untouched
+#ifdef XLLAMA_HAS_MTMD
+    if (p.session->llama_model_ptr() == nullptr) { // ORT backend has no mtmd support
+        status = "501 Not Implemented";
+        err = error_json("vision requires the llama.cpp (GGUF) backend");
+        return false;
+    }
+    const bool detailed = ::xllama::read_local_int("vision-preset.txt", 0) == 1; // 0=Fast,1=Detailed
+    static void* g_vision_model = nullptr;           // cache one mtmd ctx per model
+    static ::xllama::vision_mtmd::VisionCtx g_vctx;
+    if (g_vision_model != p.session->llama_model_ptr()) {
+        ::xllama::vision_mtmd::vision_close(g_vctx);
+        g_vctx = ::xllama::vision_mtmd::vision_open(p.session->llama_model_ptr(),
+                                                     p.session->mmproj_path(), detailed);
+        g_vision_model = p.session->llama_model_ptr();
+    }
+    auto r = ::xllama::vision_mtmd::vision_prefill(g_vctx, p.session->llama_context_ptr(), 0,
+                                                    p.prompt_for_generate, p.images);
+    if (!r.ok) { status = "500 Internal Server Error"; err = error_json("vision: " + r.error); return false; }
+    // mtmd advanced n_past over the text+image chunks; generation must CONTINUE from
+    // there (generate_from_prefilled), never re-tokenize/re-decode the prompt.
+    p.multimodal_prefilled = true;
+    return true;
+#else
+    status = "501 Not Implemented";
+    err = error_json("vision not compiled (built without libmtmd)");
+    return false;
+#endif
+}
 
 // Params that invalidate KV reuse — EXACTLY Session::sampling_matches()'s set
 // (temperature/top_p/top_k/repetition_penalty). A change here makes the Session
@@ -368,6 +487,12 @@ struct ChatPrep {
     std::vector<::xllama::ChatTurn> history;
     ::xllama::Session* session = nullptr;
     ::xllama::ChatFormat fmt;
+    std::vector<::xllama::vision::Part> images; // multimodal parts (empty = text-only fast path)
+    bool had_images = false;                    // forces full prefill (no KV reuse across image ctx)
+    // Set by apply_vision_prefill when this request actually ran mtmd prefill into the
+    // shared context. The generate call sites then continue-from-prefilled (sample from
+    // where mtmd left n_past) instead of re-tokenizing/re-decoding the prompt.
+    bool multimodal_prefilled = false;
     ::xllama::GenerateParams gp;
     // KV decision resolved in prepare_chat:
     bool kv_reuse = false;   // -> reuse_kv
@@ -401,7 +526,8 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
         err = error_json("missing or non-array 'messages'");
         return false;
     }
-    split_messages(root.GetNamedArray(L"messages"), p.system, p.history, p.final_user);
+    split_messages(root.GetNamedArray(L"messages"), p.system, p.history, p.final_user, p.images);
+    p.had_images = !p.images.empty(); // any image -> forces full prefill (no KV reuse across media)
     if (p.final_user.empty()) {
         status = "400 Bad Request";
         err = error_json("no user message to complete");
@@ -494,9 +620,18 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
     cur.final_user = p.final_user;
     cur.trimmed = trimmed;
     cur.primed = primed_on_this_generation;
+    cur.image_fingerprint = image_fingerprint(p.images);
     const ::xllama::kv::Decision decision = ::xllama::kv::decide(g_kv_memory.prev, cur);
 
-    if (decision.reuse) {
+    // Conservative multimodal rule: embedding re-injection into a REUSED KV prefix is
+    // not wired yet, so any turn that carries media (this turn OR the primed history)
+    // takes a full prefill. Reuse stays available for pure-text continuations whose
+    // image fingerprint matches (both empty). This satisfies "never reuse multimodal KV
+    // unless the exact media prefix is proven identical".
+    const bool any_media = p.had_images || !g_kv_memory.prev.image_fingerprint.empty() ||
+                           !cur.image_fingerprint.empty();
+
+    if (decision.reuse && !any_media) {
         // Continuation: send only the new turn's delta onto the persistent KV.
         p.kv_reuse = true;
         p.kv_reset = false;
@@ -530,6 +665,7 @@ void commit_kv(const ChatPrep& p, const std::string& assistant_output, bool ende
     prev.final_user.clear(); // nothing pending between turns
     prev.trimmed = false;
     prev.primed = true;
+    prev.image_fingerprint = image_fingerprint(p.images);
     g_kv_memory.primed_generation = ::xllama::session_hub().generation;
     g_kv_memory.valid = true;
     g_kv_memory.prev_ended_with_stop = ended_with_stop;
@@ -543,8 +679,14 @@ std::string handle_chat_locked(const std::string& body, const char*& status) {
     std::string err;
     if (!prepare_chat(body, p, status, err))
         return err;
+    if (!apply_vision_prefill(p, status, err)) // no-op unless the request carries images
+        return err;
 
-    const ::xllama::InferenceResult r = p.session->generate(p.gp);
+    // Multimodal turns were already prefilled by mtmd into the shared context; continue
+    // from that state (no re-tokenize/re-decode). Text-only turns use the normal path.
+    const ::xllama::InferenceResult r = p.multimodal_prefilled
+                                            ? p.session->generate_from_prefilled(p.gp)
+                                            : p.session->generate(p.gp);
     if (!r.success) {
         status = "500 Internal Server Error";
         return error_json("generation failed: " + r.error_msg);
@@ -615,6 +757,10 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
         write_response(socket, status, err); // error before any SSE bytes: plain JSON
         return;
     }
+    if (!apply_vision_prefill(p, status, err)) { // no-op unless the request carries images
+        write_response(socket, status, err);
+        return;
+    }
 
     // ---- Writer context (this thread owns the DataWriter for its whole life) ----
     DataWriter writer(socket.OutputStream());
@@ -663,7 +809,10 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
     std::thread producer([&]() {
         winrt::init_apartment(winrt::apartment_type::multi_threaded); // defensive; no WinRT calls here
         try {
-            r = p.session->generate(p.gp);
+            // Multimodal turns were prefilled by mtmd into the shared context; continue
+            // from there (no re-tokenize/re-decode). Text-only uses the normal path.
+            r = p.multimodal_prefilled ? p.session->generate_from_prefilled(p.gp)
+                                       : p.session->generate(p.gp);
             gen_ok = r.success && !session.abort_flag()->load();
             if (gen_ok)
                 session.finish(r.ended_with_stop); // flush tail + finish_reason + [DONE] + close

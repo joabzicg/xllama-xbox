@@ -44,6 +44,11 @@ struct ConvState {
     std::string final_user;             // the turn to answer now
     bool trimmed = false;               // prompt was shortened to fit n_ctx this request
     bool primed = false;                // a prior reuse-capable turn primed the Session
+    // Multimodal identity: an ordered fingerprint of every image in the conversation
+    // (FNV-1a over each bitmap's bytes, joined). Empty == text-only. KV is only reused
+    // when this EXACTLY matches the previous turn's — a changed/added/removed image means
+    // the visual prefix differs and must be re-prefilled (never reuse mismatched media).
+    std::string image_fingerprint;
 };
 
 struct Decision {
@@ -92,6 +97,12 @@ inline Decision decide(const ConvState& prev, const ConvState& cur) {
     }
     if (cur.trimmed || prev.trimmed) {
         d.reason = "prompt-trimmed";
+        return d;
+    }
+    // Multimodal: reuse only when the exact media prefix is identical. Any image in
+    // either turn whose ordered fingerprint differs forces a full re-prefill.
+    if (prev.image_fingerprint != cur.image_fingerprint) {
+        d.reason = "images-changed";
         return d;
     }
     // Strict continuation test: incoming history must equal the previous
