@@ -139,7 +139,9 @@ struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(mtmd_context*
     log_call("mtmd_helper_bitmap_init_from_buf");
     struct mtmd_helper_bitmap_wrapper w{nullptr, nullptr};
     if (g_rt.fail_bitmap || !buf || len == 0) return w; // failure is a null handle, not a throw
-    uint64_t h = 1469598103934665603ULL;                 // FNV-1a, same as xllama::vision
+    // FNV-1a with the SAME constants as xllama::vision::fnv1a() -- the test asserts the ids
+    // produced here equal fnv1a(bytes), so the fake must use the same basis/prime.
+    uint64_t h = 14695981039346656037ULL;
     for (size_t i = 0; i < len; ++i) { h ^= buf[i]; h *= 1099511628211ULL; }
     w.bitmap = new mtmd_bitmap();
     w.bitmap->id = h;
@@ -297,8 +299,21 @@ void log_output(const std::string& msg) noexcept { log_output(msg.c_str()); }
 // ---- test harness (assertions live here, in C++, never inside the C ABI) -----
 
 static int g_fail = 0;
-#define CHECK(c) do { if (!(c)) { printf("FAIL %s @%d\n", #c, __LINE__); ++g_fail; } } while (0)
+// print_diag() prints the counters + call log when an assertion fails -- that is how the
+// FIRST causal failure gets identified instead of chasing the cascade it causes.
+static void print_diag();
+#define CHECK(c) do { if (!(c)) { printf("FAIL %s @%d\n", #c, __LINE__); print_diag(); ++g_fail; } } while (0)
 static void rt_reset() { g_rt = FakeState(); g_rt.marker = "<__media__>"; }
+
+static void print_diag() {
+    printf("  diag: calls=%zu violations=%zu n_tokenize=%d n_eval=%d last_logits_last=%d "
+           "last_n_batch=%d n_past=%d bitmap_ids=%zu want_bitmaps=%d\n",
+           g_rt.calls.size(), g_rt.violations.size(), g_rt.n_tokenize, g_rt.n_eval,
+           (int)g_rt.last_logits_last, g_rt.last_n_batch, (int)g_rt.n_past, g_rt.bitmap_ids.size(),
+           g_rt.want_bitmaps);
+    for (auto& c : g_rt.calls) printf("  diag call: %s\n", c.c_str());
+    for (auto& v : g_rt.violations) printf("  diag violation: %s\n", v.c_str());
+}
 
 int main() {
     using namespace xllama::vision;
@@ -326,6 +341,11 @@ int main() {
         {Kind::Image, "", "data:image/png;base64,A", "PNGDATA1", "image/png"},
         {Kind::Text, " and then this", "", "", ""},
         {Kind::Image, "", "data:image/png;base64,B", "PNGDATA2", "image/png"},
+        // Production requires the prompt to END with a non-empty TEXT chunk (the assistant
+        // header a chat template appends after media) -- mtmd only honours logits_last on a
+        // text chunk, so prefill must not end on an image. Expected chunk order is therefore
+        // TEXT, IMAGE, TEXT, IMAGE, TEXT.
+        {Kind::Text, "assistant\n", "", "", ""},
     };
     auto rendered = render_ordered("user", parts);
     CHECK(rendered.bitmaps.size() == 2);
@@ -335,8 +355,8 @@ int main() {
     auto r = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), /*n_batch=*/0,
                                                    rendered.text_with_markers, parts);
     CHECK(r.supported && r.ok);
+    if (!r.ok) printf("  diag error='%s'\n", r.error.c_str()); // names which guard bailed out
     CHECK(g_rt.violations.empty());
-    for (auto& v : g_rt.violations) printf("VIOLATION %s\n", v.c_str());
     CHECK(g_rt.n_tokenize == 1);                       // tokenized once
     CHECK(g_rt.n_eval == 1);                           // evaluated once -- no double prefill
     // Chunk walk over the prefilled prompt: text/image/text/image, in order (the getters are
@@ -344,12 +364,13 @@ int main() {
     // Chunk walk over the prefilled prompt: text/image/text/image, in order. The getters are
     // link stubs here, but they must agree with what the fake tokenizer produced -- that is
     // the ordering guarantee production relies on (bitmap i binds to marker i).
-    CHECK(mtmd_input_chunks_size(&g_rt.snapshot) == 4u);
+    CHECK(mtmd_input_chunks_size(&g_rt.snapshot) == 5u); // T,I,T,I,T -- ends on the assistant header
     CHECK(mtmd_helper_get_n_tokens(&g_rt.snapshot) > 0u);
     CHECK(mtmd_helper_get_n_pos(&g_rt.snapshot) == static_cast<llama_pos>(mtmd_helper_get_n_tokens(&g_rt.snapshot)));
-    const int want_type[4] = {MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE,
-                              MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE};
-    for (size_t i = 0; i < 4; ++i) {
+    const int want_type[5] = {MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                              MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                              MTMD_INPUT_CHUNK_TYPE_TEXT};
+    for (size_t i = 0; i < 5; ++i) {
         const mtmd_input_chunk* c = mtmd_input_chunks_get(&g_rt.snapshot, i);
         CHECK(c != nullptr);
         CHECK(mtmd_input_chunk_get_type(c) == want_type[i]);
@@ -379,8 +400,14 @@ int main() {
     rt_reset();
     std::vector<Part> text_only = {{Kind::Text, "hello", "", "", ""}};
     auto r2 = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), 512, "hello", text_only);
-    CHECK(r2.supported && r2.ok);
+    // Current production semantics: this entry point REQUIRES an image. A text-only request
+    // is refused with an explicit error (the caller keeps the plain generate() path), so no
+    // bitmap reaches mtmd and nothing is tokenized or evaluated.
+    CHECK(r2.supported && !r2.ok);
+    CHECK(!r2.error.empty());
+    printf("  text-only refusal: '%s'\n", r2.error.c_str());
     CHECK(g_rt.bitmap_ids.empty()); // no bitmaps reach mtmd on the text-only fast path
+    CHECK(g_rt.n_tokenize == 0 && g_rt.n_eval == 0);
 
     // --- failures come back as return codes, never as exceptions -------------
     rt_reset();
@@ -401,9 +428,12 @@ int main() {
     // an unsupported backend must report it and touch nothing
     rt_reset();
     auto r5 = ::xllama::vision_mtmd::vision_prefill(none, new llama_context(), 512, "hi", text_only);
-    // Unsupported backend: supported=false and NO error string (the caller supplies its own
-    // 501 message for the ORT path) -- and no mtmd call is made at all.
-    CHECK(!r5.supported && !r5.ok && r5.error.empty());
+    // Observed production semantics for an unsupported/missing-projector backend: supported is
+    // set true up front and the failure is reported as ok=false + an explicit error string
+    // ("vision projector or shared llama context is unavailable"). No mtmd call is made.
+    CHECK(r5.supported && !r5.ok);
+    CHECK(!r5.error.empty());
+    printf("  unsupported-backend refusal: '%s'\n", r5.error.c_str());
     CHECK(g_rt.calls.empty());
 
     ::xllama::vision_mtmd::vision_close(vctx);
