@@ -76,6 +76,8 @@
         GGML_STATIC;
         GGML_VERSION=&quot;uwp-static&quot;;
         GGML_COMMIT=&quot;3cb7ffb&quot;;
+        LLAMA_VERSION=&quot;uwp-static&quot;;
+        LLAMA_COMMIT=&quot;3cb7ffb1a&quot;;
         %(PreprocessorDefinitions)
       </PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>
