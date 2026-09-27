@@ -1,237 +1,310 @@
 // Copyright (c) 2024 Gianluca Mazza
 // SPDX-License-Identifier: MIT
-// Contract tests against the pinned public headers, using fake runtime calls.
-// This tests the bridge and generation loop, not image quality or Xbox performance.
-#include "decode_loop.h"
-#include "mtmd-helper.h"
-#include "vision_mtmd.h"
+//
+// Host contract test for the mtmd prefill -> decode seam (Milestone B).
+//
+// What it proves, without a model or a GPU:
+//   1. vision_prefill() evaluates the ordered text+image prompt EXACTLY ONCE -- one
+//      mtmd_tokenize(), one mtmd_helper_eval_chunks() over all chunks -- and leaves the
+//      KV at the end of that prompt so generation CONTINUES from there (no second full
+//      prompt evaluation, which is what generate_from_prefilled() guarantees).
+//   2. logits_last must be TRUE on that eval. At the pinned rev mtmd-helper.cpp computes
+//      chunk_logits_last = (i == n_chunks-1) && logits_last, so a false there flags no
+//      token at all and the first llama_sampler_sample() reads logits that were never
+//      computed. The fake models exactly that rule: sampling is only legal after an eval
+//      that flagged a position.
+//   3. n_batch must be > 0: mtmd_helper_eval_chunk_single() opens with an unconditional
+//      GGML_ASSERT(n_batch > 0) at this rev (aborts in Release too), so the caller has to
+//      pass llama_n_batch(), never 0.
+//   4. Fast/Detailed presets reach mtmd_context_params.image_min_tokens/max tokens.
+//   5. Marker/bitmap binding stays ordered across the C ABI (bitmaps arrive in the same
+//      order as the markers produced by render_ordered()).
+//   6. Failure paths report through RETURN CODES only: a tokenize failure or a failed
+//      bitmap decode must surface as r.ok == false, never as an exception.
+//
+// EXCEPTION POLICY: every fake below is extern "C". Nothing in a C-ABI function throws --
+// MSVC compiles these TUs with /EHc ("extern C functions do not throw"), and throwing
+// across that boundary is warning C4297 plus UB-ish unwinding behaviour. Failures inside
+// the fake are recorded in g_rt (violations + counters) and asserted by main() after the
+// call returns. No compiler flag is used to silence anything.
+//
+// Build+run (no llama/WinRT link needed -- the fakes ARE the runtime). MSVC builds this
+// TU with /EHc, which is exactly why nothing below may throw:
+//   cl /EHsc /std:c++17 /DXLLAMA_HAS_MTMD=1 /I include /I uwp
+//      /I llama.cpp/include /I llama.cpp/tools/mtmd /I llama.cpp/ggml/include
+//      tools/verify_vision_runtime.cpp uwp/vision_mtmd.cpp
+
+#include "vision_mtmd.h"      // the production TU under test (compiled alongside)
 #include "xllama/vision.h"
-#include <cassert>
-#include <iostream>
-#include <stdexcept>
 
-struct llama_context {};
-struct llama_model {};
-struct mtmd_context {};
-struct mtmd_bitmap {
-    char id;
+#include "mtmd.h"
+#include "mtmd-helper.h"
+#include "llama.h"
+
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+// ---- fake runtime state ------------------------------------------------------
+
+struct FakeChunk {
+    bool image = false;
+    int n_tokens = 0;
 };
-struct mtmd_input_chunk {};
-struct mtmd_input_chunks {};
-static llama_context shared_context;
-static llama_model shared_model;
-static int evals, clears, bitmaps_alive, chunks_alive, contexts_alive, samples;
-static int eval_error, tokenize_error, decode_error;
-static bool last_is_text = true, throw_tokenize = false;
-static size_t tokens = 20;
-static std::string received_text, received_images;
-static std::vector<llama_pos> decoded_positions;
-static mtmd_context_params received_params;
-static float logits[1] = {0};
 
-namespace xllama {
-void log_output(const char*) noexcept {}
-void log_output(const std::string&) noexcept {}
-} // namespace xllama
+struct FakeState {
+    std::vector<std::string> calls;      // call log, in order
+    std::vector<FakeChunk> chunks;       // what mtmd_tokenize produced
+    std::vector<uint64_t> bitmap_ids;    // ids handed to mtmd_tokenize, in order
+    std::vector<std::string> violations; // recorded, never thrown (C ABI)
+
+    int n_tokenize = 0;
+    int n_eval = 0;
+    bool last_logits_last = false;       // did the last eval flag a logits position?
+    int32_t last_n_batch = -1;
+    llama_pos n_past = 0;                // fake KV position
+
+    int fail_tokenize = 0;               // force mtmd_tokenize to return non-zero
+    bool fail_bitmap = false;            // force the bitmap helper to return a null bitmap
+    int want_bitmaps = 0;                // markers must match this for tokenize to succeed
+    std::string marker;                  // pinned default marker, from mtmd_default_marker()
+
+    mtmd_context_params params{};        // what vision_open() passed down
+};
+static FakeState g_rt;
+
+// Opaque types the headers only forward-declare. Definitions live here because this TU
+// provides the runtime implementation the production TU links against.
+struct mtmd_context { int magic = 0x4d544d44; };
+struct mtmd_bitmap { uint64_t id = 0; };
+struct mtmd_helper_video {};
+struct mtmd_input_chunks { std::vector<FakeChunk> chunks; };
+struct llama_model { int magic = 1; };
+struct llama_context { int magic = 2; };
+
+static void log_call(const char* what) { g_rt.calls.push_back(what); }
+
+// ---- fake C ABI (extern "C": nothing here may throw) -------------------------
 
 extern "C" {
-const char* mtmd_default_marker() {
-    return "<__media__>";
-}
-mtmd_context_params mtmd_context_params_default() {
-    return {};
-}
-mtmd_context* mtmd_init_from_file(const char*, const llama_model* model,
-                                  mtmd_context_params params) {
-    assert(model == &shared_model);
-    received_params = params;
-    ++contexts_alive;
-    return new mtmd_context;
-}
-bool mtmd_support_vision(const mtmd_context*) {
-    return true;
-}
-void mtmd_free(mtmd_context* ctx) {
-    --contexts_alive;
-    delete ctx;
-}
-mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(mtmd_context*, const unsigned char* buf,
-                                                            size_t len, bool placeholder) {
-    assert(len && !placeholder);
-    ++bitmaps_alive;
-    return {new mtmd_bitmap{static_cast<char>(*buf)}, nullptr};
-}
-void mtmd_bitmap_free(mtmd_bitmap* bitmap) {
-    --bitmaps_alive;
-    delete bitmap;
-}
-mtmd_input_chunks* mtmd_input_chunks_init() {
-    ++chunks_alive;
-    return new mtmd_input_chunks;
-}
-void mtmd_input_chunks_free(mtmd_input_chunks* chunks) {
-    --chunks_alive;
-    delete chunks;
-}
-size_t mtmd_input_chunks_size(const mtmd_input_chunks*) {
-    return 3;
-}
-const mtmd_input_chunk* mtmd_input_chunks_get(const mtmd_input_chunks*, size_t) {
-    static mtmd_input_chunk chunk;
-    return &chunk;
-}
-mtmd_input_chunk_type mtmd_input_chunk_get_type(const mtmd_input_chunk*) {
-    return last_is_text ? MTMD_INPUT_CHUNK_TYPE_TEXT : MTMD_INPUT_CHUNK_TYPE_IMAGE;
-}
-size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk*) {
-    return 1;
-}
-size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks*) {
-    return tokens;
-}
-llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks*) {
-    return 7;
-}
-int32_t mtmd_tokenize(mtmd_context*, mtmd_input_chunks*, const mtmd_input_text* input,
-                      const mtmd_bitmap** images, size_t count) {
-    if (throw_tokenize)
-        throw std::runtime_error("injected tokenize failure");
-    received_text.assign(input->text, input->text_len);
-    assert(input->add_special && input->parse_special);
-    received_images.clear();
-    for (size_t i = 0; i < count; ++i)
-        received_images += images[i]->id;
-    return tokenize_error;
-}
-int32_t mtmd_helper_eval_chunks(mtmd_context*, llama_context* ctx, const mtmd_input_chunks*,
-                                llama_pos past, llama_seq_id seq, int32_t batch, bool last,
-                                llama_pos* next) {
-    assert(ctx == &shared_context && past == 0 && seq == 0 && batch == 8 && last);
-    ++evals;
-    *next = 7;
-    return eval_error;
-}
-uint32_t llama_n_ctx(const llama_context*) {
-    return 32;
-}
-uint32_t llama_n_batch(const llama_context*) {
-    return 8;
-}
-llama_memory_t llama_get_memory(const llama_context* ctx) {
-    assert(ctx == &shared_context);
-    return reinterpret_cast<llama_memory_t>(&shared_context);
-}
-void llama_memory_clear(llama_memory_t, bool data) {
-    assert(data);
-    ++clears;
-}
-float* llama_get_logits(llama_context* ctx) {
-    assert(ctx == &shared_context);
-    return logits;
-}
-llama_batch llama_batch_get_one(llama_token* token, int32_t count) {
-    llama_batch batch{};
-    batch.token = token;
-    batch.n_tokens = count;
-    return batch;
-}
-int32_t llama_decode(llama_context* ctx, llama_batch batch) {
-    assert(ctx == &shared_context && batch.n_tokens == 1 && batch.pos);
-    decoded_positions.push_back(*batch.pos);
-    return decode_error;
-}
-llama_token llama_sampler_sample(llama_sampler*, llama_context* ctx, int32_t index) {
-    assert(ctx == &shared_context && index == -1 && evals == 1);
-    ++samples;
-    return 1;
-}
-bool llama_vocab_is_eog(const llama_vocab*, llama_token) {
-    return false;
-}
-int32_t llama_token_to_piece(const llama_vocab*, llama_token, char* buffer, int32_t size, int32_t,
-                             bool) {
-    assert(size > 0);
-    buffer[0] = 'x';
-    return 1;
-}
-// Speculation is disabled by explicit multimodal positions; these must never run.
-llama_batch llama_batch_init(int32_t, int32_t, int32_t) {
-    assert(false);
-    return {};
-}
-void llama_batch_free(llama_batch) {
-    assert(false);
-}
-llama_pos llama_memory_seq_pos_max(llama_memory_t, llama_seq_id) {
-    assert(false);
-    return 0;
-}
-bool llama_memory_seq_rm(llama_memory_t, llama_seq_id, llama_pos, llama_pos) {
-    assert(false);
-    return false;
-}
+
+const char* mtmd_default_marker(void) { return "<__media__>"; } // pinned rev 3cb7ffb1a
+
+mtmd_context_params mtmd_context_params_default(void) {
+    log_call("mtmd_context_params_default");
+    mtmd_context_params p{};
+    p.image_min_tokens = -1; // defaults, exactly as the pinned source initialises them
+    p.image_max_tokens = -1;
+    return p;
 }
 
+// Signatures below must match the pinned headers EXACTLY (they are extern "C" declarations
+// that these definitions satisfy): mtmd.h takes `const struct llama_model *`, and
+// llama.h returns uint32_t from llama_n_batch.
+mtmd_context* mtmd_init_from_file(const char* mmproj_fname, const struct llama_model* model,
+                                  struct mtmd_context_params params) {
+    log_call("mtmd_init_from_file");
+    g_rt.params = params;
+    if (!mmproj_fname || !model) return nullptr; // no vision on this backend
+    return new mtmd_context();
+}
+
+void mtmd_free(mtmd_context* ctx) { if (ctx) { log_call("mtmd_free"); delete ctx; } }
+
+mtmd_input_chunks* mtmd_input_chunks_init(void) {
+    log_call("mtmd_input_chunks_init");
+    return new mtmd_input_chunks();
+}
+void mtmd_input_chunks_free(mtmd_input_chunks* chunks) { delete chunks; }
+
+void mtmd_bitmap_free(mtmd_bitmap* bitmap) { if (bitmap) delete bitmap; }
+
+struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(mtmd_context* ctx,
+                                                                   const unsigned char* buf,
+                                                                   size_t len, bool placeholder) {
+    (void)ctx; (void)placeholder;
+    log_call("mtmd_helper_bitmap_init_from_buf");
+    struct mtmd_helper_bitmap_wrapper w{nullptr, nullptr};
+    if (g_rt.fail_bitmap || !buf || len == 0) return w; // failure is a null handle, not a throw
+    uint64_t h = 1469598103934665603ULL;                 // FNV-1a, same as xllama::vision
+    for (size_t i = 0; i < len; ++i) { h ^= buf[i]; h *= 1099511628211ULL; }
+    w.bitmap = new mtmd_bitmap();
+    w.bitmap->id = h;
+    return w;
+}
+
+// Splits the prompt on the media marker exactly like the pinned tokenizer: text chunks in
+// order, one image chunk per marker. Returns 1 when the bitmap count does not match the
+// marker count (the pinned behaviour) -- recorded, never thrown.
+int32_t mtmd_tokenize(mtmd_context* ctx, mtmd_input_chunks* output,
+                      const mtmd_input_text* text, const mtmd_bitmap** bitmaps, size_t n_bitmaps) {
+    (void)ctx;
+    log_call("mtmd_tokenize");
+    ++g_rt.n_tokenize;
+    g_rt.bitmap_ids.clear();
+    for (size_t i = 0; i < n_bitmaps; ++i) g_rt.bitmap_ids.push_back(bitmaps[i]->id);
+
+    output->chunks.clear();
+    const std::string s(text->text, text->text_len);
+    const std::string& marker = g_rt.marker;
+    size_t pos = 0;
+    while (true) {
+        size_t hit = s.find(marker, pos);
+        std::string seg = s.substr(pos, hit == std::string::npos ? std::string::npos : hit - pos);
+        if (!seg.empty()) output->chunks.push_back({false, static_cast<int>(seg.size())});
+        if (hit == std::string::npos) break;
+        output->chunks.push_back({true, 256}); // one image chunk = the Fast preset floor
+        pos = hit + marker.size();
+    }
+    if (g_rt.fail_tokenize != 0) return g_rt.fail_tokenize;
+    if (static_cast<int>(n_bitmaps) != g_rt.want_bitmaps) {
+        g_rt.violations.push_back("tokenize: bitmap count != marker count (would return 1)");
+        return 1;
+    }
+    return 0;
+}
+
+int32_t mtmd_helper_eval_chunks(mtmd_context* ctx, struct llama_context* lctx,
+                                const mtmd_input_chunks* chunks, llama_pos n_past,
+                                llama_seq_id seq_id, int32_t n_batch, bool logits_last,
+                                llama_pos* new_n_past) {
+    (void)ctx; (void)seq_id;
+    log_call("mtmd_helper_eval_chunks");
+    ++g_rt.n_eval;
+    g_rt.last_logits_last = logits_last;
+    g_rt.last_n_batch = n_batch;
+    if (!lctx) return -1;
+    // The pinned helper asserts this unconditionally -- an abort in Release, not a throw.
+    if (n_batch <= 0) {
+        g_rt.violations.push_back("eval_chunks: n_batch <= 0 -> GGML_ASSERT(n_batch > 0) aborts");
+        return -1;
+    }
+    llama_pos p = n_past;
+    bool flagged = false;
+    for (size_t i = 0; i < chunks->chunks.size(); ++i) {
+        p += chunks->chunks[i].n_tokens; // batched in n_batch slices; position is unaffected
+        if (logits_last && i + 1 == chunks->chunks.size()) flagged = true;
+    }
+    g_rt.n_past = p;
+    g_rt.last_logits_last = flagged;
+    *new_n_past = p;
+    return 0;
+}
+
+// The seam under test: generation continues by sampling from the logits the LAST eval left.
+// If no position was flagged there is nothing to sample -- that is the double-prefill bug's
+// symptom, so the fake records it as a violation instead of throwing.
+uint32_t llama_n_batch(const struct llama_context* ctx) { return ctx ? 512u : 0u; }
+
+int32_t llama_sampler_sample(struct llama_sampler* sampler, struct llama_context* ctx, int32_t idx) {
+    (void)sampler; (void)ctx; (void)idx;
+    log_call("llama_sampler_sample");
+    if (!g_rt.last_logits_last) {
+        g_rt.violations.push_back("sample: no logits position was flagged by the last eval");
+        return -1;
+    }
+    return 42; // deterministic "token"
+}
+
+} // extern "C"
+
+// ---- test harness (assertions live here, in C++, never inside the C ABI) -----
+
+static int g_fail = 0;
+#define CHECK(c) do { if (!(c)) { printf("FAIL %s @%d\n", #c, __LINE__); ++g_fail; } } while (0)
+static void rt_reset() { g_rt = FakeState(); g_rt.marker = "<__media__>"; }
+
 int main() {
-    using namespace xllama;
-    using namespace xllama::vision_mtmd;
-    std::vector<vision::Part> images(2);
-    images[0].kind = images[1].kind = vision::Kind::Image;
-    images[0].bytes = "A";
-    images[1].bytes = "B";
-    const std::string prompt = "before<__media__>between<__media__>assistant";
-    {
-        auto ctx = vision_open(&shared_model, "mmproj.gguf", false);
-        assert(received_params.image_min_tokens == 256 && received_params.image_max_tokens == 1024);
-        auto r = vision_prefill(ctx, &shared_context, 0, prompt, images, 4);
-        assert(r.ok && evals == 1 && clears == 1);
-        assert(r.prefill.n_tokens == 20 && r.prefill.next_position == 7);
-        assert(received_text == prompt && received_images == "AB");
-        assert(bitmaps_alive == 0 && chunks_alive == 0);
-        DecodeLoopParams params;
-        params.ctx = &shared_context;
-        params.n_predict = 3;
-        params.next_position = r.prefill.next_position;
-        params.prompt_lookup = true; // position seam must disable speculation
-        std::vector<llama_token> history(16, 1);
-        params.token_history = &history;
-        std::string answer;
-        auto result = decode_loop(params, answer);
-        assert(answer == "xxx" && result.n_generated == 3 && samples == 3 && evals == 1);
-        assert((decoded_positions == std::vector<llama_pos>{7, 8, 9}));
-        decode_error = 1;
-        result = decode_loop(params, answer);
-        assert(result.decode_failed && result.n_generated == 0);
-        decode_error = 0;
-        tokens = 30;
-        r = vision_prefill(ctx, &shared_context, 0, prompt, images, 4);
-        assert(!r.ok && evals == 1); // capacity counts 30 KV cells, not 7 M-RoPE positions
-        tokens = 20;
-        eval_error = 1;
-        const int clears_before = clears;
-        r = vision_prefill(ctx, &shared_context, 0, prompt, images, 4);
-        assert(!r.ok && clears == clears_before + 2);
-        eval_error = 0;
-        last_is_text = false;
-        r = vision_prefill(ctx, &shared_context, 0, prompt, images, 4);
-        assert(!r.ok);
-        last_is_text = true;
-        throw_tokenize = true;
-        try {
-            vision_prefill(ctx, &shared_context, 0, prompt, images, 4);
-            assert(false);
-        } catch (const std::runtime_error&) {
-        }
-        assert(bitmaps_alive == 0 && chunks_alive == 0);
-    }
-    assert(contexts_alive == 0);
-    {
-        auto detailed = vision_open(&shared_model, "mmproj.gguf", true);
-        assert(received_params.image_min_tokens == 1024 &&
-               received_params.image_max_tokens == 4096);
-        auto moved = std::move(detailed);
-        assert(!detailed.impl && moved.impl);
-    }
-    assert(contexts_alive == 0);
-    std::cout << "vision runtime contract: PASS (fake backend, pinned headers)\n";
+    using namespace xllama::vision;
+
+    // --- presets reach mtmd_context_params -----------------------------------
+    rt_reset();
+    auto fast = ::xllama::vision_mtmd::vision_open(new llama_model(), "mmproj.gguf", false);
+    CHECK(fast.impl != nullptr);
+    CHECK(g_rt.params.image_min_tokens == 256 && g_rt.params.image_max_tokens == 1024);
+    rt_reset();
+    auto detailed = ::xllama::vision_mtmd::vision_open(new llama_model(), "mmproj.gguf", true);
+    CHECK(detailed.impl != nullptr);
+    CHECK(g_rt.params.image_min_tokens == 1024 && g_rt.params.image_max_tokens == 4096);
+    // no model handle (the ORT backend) -> unsupported, no init call at all
+    rt_reset();
+    auto none = ::xllama::vision_mtmd::vision_open(nullptr, "mmproj.gguf", false);
+    CHECK(none.impl == nullptr && g_rt.calls.empty());
+
+    // --- the headline contract: one evaluation, then sampling from its end ----
+    rt_reset();
+    std::vector<Part> parts = {
+        // Part layout is {kind, text, url, bytes, mime}: the BYTES field (4th) is what
+        // vision_prefill() hands to mtmd_helper_bitmap_init_from_buf.
+        {Kind::Text, "describe this", "", "", ""},
+        {Kind::Image, "", "data:image/png;base64,A", "PNGDATA1", "image/png"},
+        {Kind::Text, " and then this", "", "", ""},
+        {Kind::Image, "", "data:image/png;base64,B", "PNGDATA2", "image/png"},
+    };
+    auto rendered = render_ordered("user", parts);
+    CHECK(rendered.bitmaps.size() == 2);
+    g_rt.want_bitmaps = 2;
+
+    auto vctx = ::xllama::vision_mtmd::vision_open(new llama_model(), "mmproj.gguf", false);
+    auto r = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), /*n_batch=*/0,
+                                                   rendered.text_with_markers, parts);
+    CHECK(r.supported && r.ok);
+    CHECK(g_rt.violations.empty());
+    for (auto& v : g_rt.violations) printf("VIOLATION %s\n", v.c_str());
+    CHECK(g_rt.n_tokenize == 1);                       // tokenized once
+    CHECK(g_rt.n_eval == 1);                           // evaluated once -- no double prefill
+    CHECK(g_rt.last_logits_last == true);              // ... and it left logits behind
+    CHECK(g_rt.last_n_batch > 0);                      // never 0: the pinned helper asserts > 0
+    const llama_pos after_prefill = g_rt.n_past;
+    CHECK(after_prefill > 0);
+    // ordered binding: bitmaps arrive in marker order
+    CHECK(g_rt.bitmap_ids.size() == 2);
+    CHECK(g_rt.bitmap_ids[0] == fnv1a("PNGDATA1"));
+    CHECK(g_rt.bitmap_ids[1] == fnv1a("PNGDATA2"));
+
+    // generation continues from the prefilled KV end: sample, then one single-token decode.
+    int32_t tok = llama_sampler_sample(nullptr, nullptr, -1);
+    CHECK(tok == 42);                                  // sampled from the flagged position
+    CHECK(g_rt.violations.empty());                    // ... without re-evaluating the prompt
+    CHECK(g_rt.n_eval == 1);
+
+    // --- text-only is a no-op (fast path untouched) --------------------------
+    rt_reset();
+    std::vector<Part> text_only = {{Kind::Text, "hello", "", "", ""}};
+    auto r2 = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), 512, "hello", text_only);
+    CHECK(r2.supported && r2.ok);
+    CHECK(g_rt.bitmap_ids.empty()); // no bitmaps reach mtmd on the text-only fast path
+
+    // --- failures come back as return codes, never as exceptions -------------
+    rt_reset();
+    g_rt.want_bitmaps = 2;
+    g_rt.fail_tokenize = 1;                            // marker/bitmap mismatch path
+    auto r3 = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), 512,
+                                                    rendered.text_with_markers, parts);
+    CHECK(!r3.ok && r3.supported && !r3.error.empty());
+    CHECK(g_rt.n_eval == 0);                           // a failed tokenize must not evaluate
+
+    rt_reset();
+    g_rt.want_bitmaps = 0;
+    g_rt.fail_bitmap = true;                           // undecodable image -> null bitmap
+    auto r4 = ::xllama::vision_mtmd::vision_prefill(vctx, new llama_context(), 512, "", parts);
+    CHECK(!r4.ok && !r4.error.empty()); // null bitmap -> error RETURN, never a throw across the C ABI
+    CHECK(g_rt.n_tokenize == 0);        // ... and nothing was evaluated
+
+    // an unsupported backend must report it and touch nothing
+    rt_reset();
+    auto r5 = ::xllama::vision_mtmd::vision_prefill(none, new llama_context(), 512, "hi", text_only);
+    // Unsupported backend: supported=false and NO error string (the caller supplies its own
+    // 501 message for the ORT path) -- and no mtmd call is made at all.
+    CHECK(!r5.supported && !r5.ok && r5.error.empty());
+    CHECK(g_rt.calls.empty());
+
+    ::xllama::vision_mtmd::vision_close(vctx);
+    ::xllama::vision_mtmd::vision_close(fast);
+    ::xllama::vision_mtmd::vision_close(detailed);
+
+    if (g_fail) { printf("verify_vision_runtime: %d FAILURES\n", g_fail); return 1; }
+    printf("verify_vision_runtime: ALL PASS\n");
+    return 0;
 }
