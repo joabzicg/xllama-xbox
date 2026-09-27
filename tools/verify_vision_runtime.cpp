@@ -48,14 +48,25 @@
 
 // ---- fake runtime state ------------------------------------------------------
 
-struct FakeChunk {
-    bool image = false;
-    int n_tokens = 0;
-};
+// Opaque types the headers only forward-declare. Definitions live here because this TU
+// provides the runtime implementation the production TU links against.
+struct mtmd_input_chunk { bool image = false; int n_tokens = 0; };
+struct mtmd_context { int magic = 0x4d544d44; };
+struct mtmd_bitmap { uint64_t id = 0; };
+struct mtmd_helper_video {};
+struct mtmd_input_chunks { std::vector<mtmd_input_chunk> chunks; };
+struct llama_model { int magic = 1; };
+struct llama_context { int magic = 2; };
+// Fake KV handle: llama_get_memory()/llama_memory_clear() must agree on one object, and
+// llama_get_logits() needs somewhere to point. Opaque storage behind the C typedefs.
+struct FakeMemory { int magic = 0x4d454d31; };
+struct FakeLogits { float v[8] = {0.f}; };
+static FakeMemory g_fake_mem;
+static FakeLogits g_fake_logits;
 
 struct FakeState {
     std::vector<std::string> calls;      // call log, in order
-    std::vector<FakeChunk> chunks;       // what mtmd_tokenize produced
+    mtmd_input_chunks snapshot;          // copy of what the last mtmd_tokenize produced
     std::vector<uint64_t> bitmap_ids;    // ids handed to mtmd_tokenize, in order
     std::vector<std::string> violations; // recorded, never thrown (C ABI)
 
@@ -71,17 +82,9 @@ struct FakeState {
     std::string marker;                  // pinned default marker, from mtmd_default_marker()
 
     mtmd_context_params params{};        // what vision_open() passed down
+    mtmd_context* last_ctx = nullptr;    // the fake handle vision_open() was handed back
 };
 static FakeState g_rt;
-
-// Opaque types the headers only forward-declare. Definitions live here because this TU
-// provides the runtime implementation the production TU links against.
-struct mtmd_context { int magic = 0x4d544d44; };
-struct mtmd_bitmap { uint64_t id = 0; };
-struct mtmd_helper_video {};
-struct mtmd_input_chunks { std::vector<FakeChunk> chunks; };
-struct llama_model { int magic = 1; };
-struct llama_context { int magic = 2; };
 
 static void log_call(const char* what) { g_rt.calls.push_back(what); }
 
@@ -107,7 +110,8 @@ mtmd_context* mtmd_init_from_file(const char* mmproj_fname, const struct llama_m
     log_call("mtmd_init_from_file");
     g_rt.params = params;
     if (!mmproj_fname || !model) return nullptr; // no vision on this backend
-    return new mtmd_context();
+    g_rt.last_ctx = new mtmd_context();
+    return g_rt.last_ctx;
 }
 
 void mtmd_free(mtmd_context* ctx) { if (ctx) { log_call("mtmd_free"); delete ctx; } }
@@ -116,7 +120,15 @@ mtmd_input_chunks* mtmd_input_chunks_init(void) {
     log_call("mtmd_input_chunks_init");
     return new mtmd_input_chunks();
 }
-void mtmd_input_chunks_free(mtmd_input_chunks* chunks) { delete chunks; }
+// Snapshot before freeing so main() can walk the chunks the fake tokenizer produced (the
+// caller owns and frees the object, so this is the only chance to inspect it).
+// Snapshot before freeing so main() can walk the chunks the fake tokenizer produced (the
+// caller owns and frees the object, so this is the only chance to inspect it).
+void mtmd_input_chunks_free(mtmd_input_chunks* chunks) {
+    if (!chunks) return;
+    g_rt.snapshot.chunks = chunks->chunks;
+    delete chunks;
+}
 
 void mtmd_bitmap_free(mtmd_bitmap* bitmap) { if (bitmap) delete bitmap; }
 
@@ -146,6 +158,7 @@ int32_t mtmd_tokenize(mtmd_context* ctx, mtmd_input_chunks* output,
     for (size_t i = 0; i < n_bitmaps; ++i) g_rt.bitmap_ids.push_back(bitmaps[i]->id);
 
     output->chunks.clear();
+    g_rt.snapshot.chunks.clear();
     const std::string s(text->text, text->text_len);
     const std::string& marker = g_rt.marker;
     size_t pos = 0;
@@ -207,7 +220,79 @@ int32_t llama_sampler_sample(struct llama_sampler* sampler, struct llama_context
     return 42; // deterministic "token"
 }
 
+// ---- link-completeness fakes for the rest of the pinned C API ----------------
+// These exist so this TU links against uwp/vision_mtmd.cpp without pulling all of
+// libllama/libmtmd. Signatures are copied VERBATIM from the pinned headers (3cb7ffb1a):
+//   mtmd.h:      bool mtmd_support_vision(const mtmd_context *);
+//              size_t mtmd_input_chunks_size(const mtmd_input_chunks *);
+//              const mtmd_input_chunk * mtmd_input_chunks_get(const mtmd_input_chunks *, size_t);
+//              enum mtmd_input_chunk_type mtmd_input_chunk_get_type(const mtmd_input_chunk *);
+//              size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk *);
+//   mtmd-helper.h: size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks *);
+//                  llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks *);
+//   llama.h:     uint32_t llama_n_ctx(const struct llama_context *);
+//                llama_memory_t llama_get_memory(const struct llama_context *);
+//                void llama_memory_clear(llama_memory_t, bool);
+//                float * llama_get_logits(struct llama_context *);
+// Same rule as everything else here: NONE of them throw. Failures are recorded in g_rt and
+// asserted by main() after the call returns (/EHc on MSVC -- C4297 is what a throw here costs).
+
+bool mtmd_support_vision(const mtmd_context* ctx) { return ctx != nullptr; }
+
+size_t mtmd_input_chunks_size(const mtmd_input_chunks* chunks) {
+    return chunks ? chunks->chunks.size() : 0u;
+}
+const mtmd_input_chunk* mtmd_input_chunks_get(const mtmd_input_chunks* chunks, size_t idx) {
+    if (!chunks || idx >= chunks->chunks.size()) return nullptr; // null, never a throw
+    return &chunks->chunks[idx];
+}
+enum mtmd_input_chunk_type mtmd_input_chunk_get_type(const mtmd_input_chunk* chunk) {
+    if (!chunk) return MTMD_INPUT_CHUNK_TYPE_COUNT;
+    return chunk->image ? MTMD_INPUT_CHUNK_TYPE_IMAGE : MTMD_INPUT_CHUNK_TYPE_TEXT;
+}
+size_t mtmd_input_chunk_get_n_tokens(const mtmd_input_chunk* chunk) {
+    return chunk ? static_cast<size_t>(chunk->n_tokens) : 0u;
+}
+size_t mtmd_helper_get_n_tokens(const mtmd_input_chunks* chunks) {
+    if (!chunks) return 0u;
+    size_t n = 0;
+    for (const auto& c : chunks->chunks) n += static_cast<size_t>(c.n_tokens);
+    return n;
+}
+// Fake model is non-M-RoPE, so n_pos == n_tokens here. Recorded so a future M-RoPE
+// contract test can differ from it without touching the assertions above.
+llama_pos mtmd_helper_get_n_pos(const mtmd_input_chunks* chunks) {
+    return static_cast<llama_pos>(mtmd_helper_get_n_tokens(chunks));
+}
+
+uint32_t llama_n_ctx(const struct llama_context* ctx) { return ctx ? 4096u : 0u; }
+llama_memory_t llama_get_memory(const struct llama_context* ctx) {
+    return ctx ? reinterpret_cast<llama_memory_t>(&g_fake_mem) : nullptr;
+}
+void llama_memory_clear(llama_memory_t mem, bool data) {
+    (void)data;
+    log_call("llama_memory_clear");
+    if (mem != reinterpret_cast<llama_memory_t>(&g_fake_mem))
+        g_rt.violations.push_back("memory_clear: handle not the one llama_get_memory handed out");
+}
+// Only legal after an eval that flagged a logits position -- same invariant as sampling.
+float* llama_get_logits(struct llama_context* ctx) {
+    log_call("llama_get_logits");
+    if (!ctx) return nullptr;
+    if (!g_rt.last_logits_last)
+        g_rt.violations.push_back("get_logits: no logits position was flagged by the last eval");
+    return g_fake_logits.v;
+}
+
 } // extern "C"
+
+// xllama::log_output is declared in include/xllama/platform.h (C++ linkage, noexcept).
+// The UWP/production definition lives in src/bridge/platform.cpp, which this TU does not
+// link, so it is stubbed here. noexcept AND non-throwing.
+namespace xllama {
+void log_output(const char* msg) noexcept { if (msg) printf("[fake] %s\n", msg); }
+void log_output(const std::string& msg) noexcept { log_output(msg.c_str()); }
+} // namespace xllama
 
 // ---- test harness (assertions live here, in C++, never inside the C ABI) -----
 
@@ -254,6 +339,27 @@ int main() {
     for (auto& v : g_rt.violations) printf("VIOLATION %s\n", v.c_str());
     CHECK(g_rt.n_tokenize == 1);                       // tokenized once
     CHECK(g_rt.n_eval == 1);                           // evaluated once -- no double prefill
+    // Chunk walk over the prefilled prompt: text/image/text/image, in order (the getters are
+    // link stubs here, but they must agree with what the fake tokenizer produced).
+    // Chunk walk over the prefilled prompt: text/image/text/image, in order. The getters are
+    // link stubs here, but they must agree with what the fake tokenizer produced -- that is
+    // the ordering guarantee production relies on (bitmap i binds to marker i).
+    CHECK(mtmd_input_chunks_size(&g_rt.snapshot) == 4u);
+    CHECK(mtmd_helper_get_n_tokens(&g_rt.snapshot) > 0u);
+    CHECK(mtmd_helper_get_n_pos(&g_rt.snapshot) == static_cast<llama_pos>(mtmd_helper_get_n_tokens(&g_rt.snapshot)));
+    const int want_type[4] = {MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE,
+                              MTMD_INPUT_CHUNK_TYPE_TEXT, MTMD_INPUT_CHUNK_TYPE_IMAGE};
+    for (size_t i = 0; i < 4; ++i) {
+        const mtmd_input_chunk* c = mtmd_input_chunks_get(&g_rt.snapshot, i);
+        CHECK(c != nullptr);
+        CHECK(mtmd_input_chunk_get_type(c) == want_type[i]);
+        CHECK(mtmd_input_chunk_get_n_tokens(c) > 0u);
+    }
+    CHECK(mtmd_input_chunks_get(&g_rt.snapshot, 99) == nullptr); // out of range -> null, not a throw
+    CHECK(g_rt.last_ctx != nullptr && mtmd_support_vision(g_rt.last_ctx));
+    CHECK(llama_n_ctx(nullptr) == 0u || llama_n_ctx(nullptr) > 0u); // stub answers, never throws
+    CHECK(llama_get_memory(nullptr) == nullptr);
+    CHECK(llama_get_logits(nullptr) == nullptr); // no ctx -> null, not a throw
     CHECK(g_rt.last_logits_last == true);              // ... and it left logits behind
     CHECK(g_rt.last_n_batch > 0);                      // never 0: the pinned helper asserts > 0
     const llama_pos after_prefill = g_rt.n_past;
