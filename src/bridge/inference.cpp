@@ -396,6 +396,12 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; // CPU only on Linux path
+#ifdef XLLAMA_UWP
+    // Xbox/UWP: skip llama.cpp's extra CPU buffers (weight repacking). The
+    // CPU_REPACK buffer alone exceeds the app's working-set budget on load;
+    // non-UWP builds keep their default.
+    mparams.use_extra_bufts = false;
+#endif
     load_diag::log_model_params("before model load", mparams);
     load_diag::log_memory_snapshot("before model load");
 

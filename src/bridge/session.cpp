@@ -1205,6 +1205,12 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = sp.n_gpu_layers;
+#ifdef XLLAMA_UWP
+    // Xbox/UWP: skip llama.cpp's extra CPU buffers (weight repacking). The
+    // CPU_REPACK buffer alone (~1.3 GB for Qwen2.5-VL) exceeds the app's
+    // working-set budget on load; non-UWP builds keep their default.
+    mparams.use_extra_bufts = false;
+#endif
     load_diag::log_model_params("before model load", mparams);
     load_diag::log_memory_snapshot("before model load");
 
