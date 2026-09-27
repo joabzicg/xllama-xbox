@@ -29,7 +29,7 @@ inference core (`SessionHub`) with OpenAI and Ollama-compatible APIs.
 **Status:** v1, opt-in, default OFF. Dev Mode / LAN research only.
 
 ```bash
-# Chat completions (non-streaming)
+# Chat completions (JSON; add "stream": true for SSE)
 curl -s http://<xbox-ip>:11434/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"lfm25-350m","messages":[{"role":"user","content":"hi"}]}'
@@ -54,15 +54,15 @@ curl -s http://<xbox-ip>:11434/v1/images/generations \
 
 ### Protocol
 
-| Route                         | Shape      | Note                                    |
-| ----------------------------- | ---------- | --------------------------------------- |
-| `POST /v1/chat/completions`   | OpenAI     | Non-streaming, single-slot mutex        |
-| `GET /v1/models`              | OpenAI     | `"active": true` on the loaded model    |
-| `GET /api/tags`               | Ollama     | Same list, Ollama shape                 |
-| `POST /v1/preferences`        | Custom     | Append JSONL → `training/samples.jsonl` |
-| `GET /v1/training/status`     | Custom     | Snapshot of on-device train progress    |
-| `POST /v1/images/generations` | OpenAI-ish | SD-Turbo, `b64_json` + `path`           |
-| `GET /health`                 | Custom     | `{"status":"ok","service":"xllama"}`    |
+| Route                         | Shape      | Note                                            |
+| ----------------------------- | ---------- | ----------------------------------------------- |
+| `POST /v1/chat/completions`   | OpenAI     | JSON/SSE, native image input, single-slot mutex |
+| `GET /v1/models`              | OpenAI     | `"active": true` on the loaded model            |
+| `GET /api/tags`               | Ollama     | Same list, Ollama shape                         |
+| `POST /v1/preferences`        | Custom     | Append JSONL → `training/samples.jsonl`         |
+| `GET /v1/training/status`     | Custom     | Snapshot of on-device train progress            |
+| `POST /v1/images/generations` | OpenAI-ish | SD-Turbo, `b64_json` + `path`                   |
+| `GET /health`                 | Custom     | `{"status":"ok","service":"xllama"}`            |
 
 ### Requirements
 
@@ -133,11 +133,11 @@ Llama.cpp is both benchmarking lane and shipping backend.
 
 ## Supported models
 
-| Model | Params | Decode | Role |
-| ----- | ------ | ------ | ---- |
-| LFM2.5-230M | 230M | **119.2** tok/s | Floor (fastest, 241 MB) |
-| LFM2.5-350M | 350M | **94.9** tok/s | Default chat |
-| LFM2-2.6B | 2.6B | **18.4** tok/s | Quality (H9 7/8) |
+| Model       | Params | Decode          | Role                    |
+| ----------- | ------ | --------------- | ----------------------- |
+| LFM2.5-230M | 230M   | **119.2** tok/s | Floor (fastest, 241 MB) |
+| LFM2.5-350M | 350M   | **94.9** tok/s  | Default chat            |
+| LFM2-2.6B   | 2.6B   | **18.4** tok/s  | Quality (H9 7/8)        |
 
 Full catalogue + Phase 14 coding models: [model-matrix.md](docs/model-matrix.md) · [benchmarks.md](docs/benchmarks.md)
 

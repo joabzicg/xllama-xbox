@@ -4,6 +4,8 @@
 #include "xllama/path_utils.h"
 #include "xllama/platform.h"
 
+#include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 #ifdef XLLAMA_UWP
@@ -293,6 +295,12 @@ std::string first_gguf_in_dir(const std::string& path, const std::string& exclud
         if (ec || de.path().extension() != ".gguf")
             continue;
         const std::string name = de.path().filename().string();
+        std::string lower_name = name;
+        std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        // Projectors are GGUF files too, but must never be loaded as the language model.
+        if (lower_name.find("mmproj") != std::string::npos)
+            continue;
         if (!exclude_filename.empty() && name == exclude_filename)
             continue;
         // Prefer non-adapter-looking names when no model.gguf
@@ -307,6 +315,32 @@ std::string first_gguf_in_dir(const std::string& path, const std::string& exclud
     if (!preferred.empty())
         return preferred;
     return fallback;
+}
+
+std::string find_mmproj_in_dir(const std::string& path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path directory = fs::u8path(path);
+    if (!fs::is_directory(directory, ec))
+        directory = directory.parent_path();
+    if (directory.empty())
+        directory = ".";
+    std::string result;
+    for (const auto& entry : fs::directory_iterator(directory, ec)) {
+        if (ec || !entry.is_regular_file(ec))
+            continue;
+        std::string name = entry.path().filename().u8string();
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (name.find("mmproj") != std::string::npos && name.size() >= 5 &&
+            name.compare(name.size() - 5, 5, ".gguf") == 0) {
+            // Ambiguous directories require an explicit projector; never guess a pairing.
+            if (!result.empty())
+                return {};
+            result = entry.path().u8string();
+        }
+    }
+    return result;
 }
 
 } // namespace xllama

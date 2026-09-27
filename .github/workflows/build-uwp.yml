@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: false
+          submodules: recursive
           fetch-depth: 1
 
       - uses: ./.github/actions/build-uwp-package
@@ -61,7 +61,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          submodules: false
+          submodules: recursive
           fetch-depth: 1
 
       - uses: ./.github/actions/build-uwp-package

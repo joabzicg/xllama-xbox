@@ -39,7 +39,7 @@ jobs:
         if: matrix.variant == 'unified'
         shell: bash
         run: |
-          git submodule update --init --depth 1 llama.cpp
+          git submodule update --init --recursive --depth 1 llama.cpp
           bash scripts/apply-uwp-patches.sh
           bash scripts/check-uwp-sources.sh
 

@@ -80,7 +80,7 @@ inline bool model_dir_files_ready(const std::vector<std::string>& files) {
         if (name == "genai_config.json" || name == "model.onnx")
             return true;
         if (name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0 &&
-            name != "adapter.gguf")
+            name != "adapter.gguf" && name.find("mmproj") == std::string::npos)
             return true;
     }
     return false;

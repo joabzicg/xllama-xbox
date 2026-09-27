@@ -31,6 +31,9 @@
     <ClCompile Include="api-server.cpp">
       <Filter>xllama</Filter>
     </ClCompile>
+    <ClCompile Include="vision_mtmd.cpp">
+      <Filter>xllama</Filter>
+    </ClCompile>
     <ClCompile Include="MainPage.cpp">
       <Filter>xllama</Filter>
     </ClCompile>

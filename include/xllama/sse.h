@@ -49,7 +49,9 @@ inline std::string http_chunk(const std::string& payload) {
 
 // Terminator of a chunked body: zero-length chunk + CRLF. Sent once, after the
 // final [DONE] event.
-inline std::string http_last_chunk() { return "0\r\n\r\n"; }
+inline std::string http_last_chunk() {
+    return "0\r\n\r\n";
+}
 
 // SSE response header block. No Content-Length (chunked). CORS preserved so a
 // browser EventSource / OpenAI SDK can consume it cross-origin, matching the
@@ -77,7 +79,9 @@ inline std::string sse_data(const std::string& json) {
 }
 
 // The terminal SSE payload (not JSON): the literal OpenAI end-of-stream marker.
-inline std::string sse_done_payload() { return "[DONE]"; }
+inline std::string sse_done_payload() {
+    return "[DONE]";
+}
 
 // Build one chat.completion.chunk JSON object. Exactly one of role/content/
 // finish is normally non-empty per event, matching OpenAI: empty fields are
@@ -122,6 +126,58 @@ inline std::string build_chunk(const std::string& id, const std::string& model, 
 }
 
 // ---------------------------------------------------------------------------
+// Token pieces can split UTF-8 scalars. Keep incomplete suffixes until the next
+// piece, and replace invalid/truncated sequences so every JSON event is UTF-8.
+class Utf8Assembler {
+  public:
+    std::string feed(const std::string& bytes, bool final = false) {
+        pending_ += bytes;
+        std::string out;
+        size_t i = 0;
+        while (i < pending_.size()) {
+            const unsigned char c = static_cast<unsigned char>(pending_[i]);
+            const size_t width = c < 0x80                 ? 1
+                                 : c >= 0xc2 && c <= 0xdf ? 2
+                                 : c >= 0xe0 && c <= 0xef ? 3
+                                 : c >= 0xf0 && c <= 0xf4 ? 4
+                                                          : 0;
+            if (!width) {
+                out += "\xef\xbf\xbd";
+                ++i;
+                continue;
+            }
+            bool valid = true;
+            for (size_t j = 1; j < width && i + j < pending_.size(); ++j) {
+                const unsigned char d = static_cast<unsigned char>(pending_[i + j]);
+                if (d < 0x80 || d > 0xbf ||
+                    (j == 1 && ((c == 0xe0 && d < 0xa0) || (c == 0xed && d > 0x9f) ||
+                                (c == 0xf0 && d < 0x90) || (c == 0xf4 && d > 0x8f))))
+                    valid = false;
+            }
+            if (!valid) {
+                out += "\xef\xbf\xbd";
+                ++i;
+                continue;
+            }
+            if (pending_.size() - i < width) {
+                if (!final)
+                    break;
+                out += "\xef\xbf\xbd";
+                i = pending_.size();
+                break;
+            }
+            out.append(pending_, i, width);
+            i += width;
+        }
+        pending_.erase(0, i);
+        return out;
+    }
+
+  private:
+    std::string pending_;
+};
+
+// ---------------------------------------------------------------------------
 // Stop-aware streaming assembler
 //
 // on_token fires for EVERY sampled piece BEFORE the decode loop runs its stop
@@ -132,26 +188,31 @@ inline std::string build_chunk(const std::string& id, const std::string& model, 
 // ever emitting a partial/complete stop marker.
 // ---------------------------------------------------------------------------
 class StopAwareAssembler {
-public:  
+  public:
     explicit StopAwareAssembler(std::vector<std::string> stops) : stops_(std::move(stops)) {}
 
     // Feed one detokenized piece (a view — copied immediately by the caller).
     // Returns bytes safe to emit now as a content event; empty if everything so
     // far could still turn out to be a stop sequence.
     std::string feed(const std::string& piece) {
+        if (stop_seen_)
+            return {};
         pending_ += piece;
         // A complete stop sequence anywhere in pending means generation is over:
         // emit the text before it and drop the marker itself.
+        size_t first_stop = std::string::npos;
         for (const auto& s : stops_) {
             if (s.empty())
                 continue;
             size_t pos = pending_.find(s);
-            if (pos != std::string::npos) {
-                stop_seen_ = true;
-                std::string emit = pending_.substr(0, pos);
-                pending_.clear();
-                return emit;
-            }
+            if (pos < first_stop)
+                first_stop = pos;
+        }
+        if (first_stop != std::string::npos) {
+            stop_seen_ = true;
+            std::string emit = pending_.substr(0, first_stop);
+            pending_.clear();
+            return utf8_.feed(emit);
         }
         // Hold back the longest suffix of pending that is a strict prefix of any
         // stop sequence; release the rest now.
@@ -159,7 +220,7 @@ public:
         if (pending_.size() > hold) {
             std::string emit = pending_.substr(0, pending_.size() - hold);
             pending_.erase(0, pending_.size() - hold);
-            return emit;
+            return utf8_.feed(emit);
         }
         return {};
     }
@@ -170,14 +231,14 @@ public:
     std::string flush_tail(bool ended_with_stop) {
         if (ended_with_stop || stop_seen_) {
             pending_.clear();
-            return {};
+            return utf8_.feed({}, true);
         }
         std::string emit = pending_;
         pending_.clear();
-        return emit;
+        return utf8_.feed(emit, true);
     }
 
-private:
+  private:
     // Longest suffix of pending_ that is a strict prefix of any stop sequence.
     size_t held_back_len() const {
         size_t best = 0;
@@ -196,6 +257,7 @@ private:
     std::vector<std::string> stops_;
     std::string pending_;
     bool stop_seen_ = false;
+    Utf8Assembler utf8_;
 };
 
 // ---------------------------------------------------------------------------
@@ -206,8 +268,7 @@ private:
 // through the StopAwareAssembler, enqueues one framed SSE event and RETURNS. It
 // never touches the socket. A single consumer (drain) drains the queue and calls
 // the sink; the sink is the only place that awaits StoreAsync/FlushAsync. So the
-// decode thread never waits on LAN I/O except as backpressure when the bounded
-// queue is full (memory safety valve), which a live client keeps drained.
+// decode thread never waits on LAN I/O; a full queue explicitly aborts the stream.
 //
 // The sink returns false on write failure (client gone): the session then sets its
 // abort flag, which the caller wires to GenerateParams::abort_flag so the decode
@@ -215,20 +276,25 @@ private:
 // guaranteed by the FIFO queue; memory is bounded by max_frames.
 // ---------------------------------------------------------------------------
 class SseStreamSession {
-public:
+  public:
     using Sink = std::function<bool(const std::string& framed_bytes)>;
 
     SseStreamSession(std::string id, std::string model, long long created,
                      std::vector<std::string> stops, Sink sink, size_t max_frames = 4096)
         : id_(std::move(id)), model_(std::move(model)), created_(created),
-          assembler_(std::move(stops)), sink_(std::move(sink)), max_frames_(max_frames ? max_frames : 1) {}
+          assembler_(std::move(stops)), sink_(std::move(sink)),
+          max_frames_(max_frames ? max_frames : 1) {}
 
     // The abort flag the caller must wire to GenerateParams::abort_flag. Set on
     // sink failure (client gone) OR on bounded-queue backpressure overflow.
-    std::atomic<bool>* abort_flag() { return &abort_; }
+    std::atomic<bool>* abort_flag() {
+        return &abort_;
+    }
 
     // Emit the role-first event (empty content, null finish). Call once before tokens.
-    void emit_role_first() { enqueue_frame(build_event("assistant", "", "")); }
+    void emit_role_first() {
+        enqueue_frame(build_event("assistant", "", ""));
+    }
 
     // PRODUCER (runs on the decode thread). Copy the view immediately, assemble
     // (stop-aware), enqueue if there are emittable bytes, RETURN IMMEDIATELY. It
@@ -245,12 +311,12 @@ public:
 
     // Finish (success path): flush the held-back tail (dropped if a stop completed
     // it), then the finish_reason chunk, [DONE], and the terminator; then close.
-    void finish(bool ended_with_stop) {
+    void finish(bool ended_with_stop, bool ended_naturally = false) {
         const std::string tail = assembler_.flush_tail(ended_with_stop);
         if (!tail.empty())
             enqueue_frame(build_event("", tail, ""));
-        enqueue_frame(build_event("", "", ended_with_stop ? "stop" : "length"));
-        enqueue_frame(sse_data(sse_done_payload()));
+        enqueue_frame(build_event("", "", ended_with_stop || ended_naturally ? "stop" : "length"));
+        enqueue_frame(http_chunk(sse_data(sse_done_payload())));
         enqueue_frame(http_last_chunk());
         close();
     }
@@ -290,7 +356,7 @@ public:
         return true;
     }
 
-private:
+  private:
     std::string build_event(const std::string& role, const std::string& content,
                             const std::string& finish) {
         return http_chunk(sse_data(build_chunk(id_, model_, created_, 0, role, content, finish)));
@@ -334,13 +400,15 @@ private:
 // blocked in drain_one_blocking is always woken, even if generation throws or an
 // early return skips finish(). Idempotent with an explicit finish()->close().
 class SseCloseGuard {
-public:
+  public:
     explicit SseCloseGuard(SseStreamSession& s) : s_(s) {}
-    ~SseCloseGuard() { s_.close(); }
+    ~SseCloseGuard() {
+        s_.close();
+    }
     SseCloseGuard(const SseCloseGuard&) = delete;
     SseCloseGuard& operator=(const SseCloseGuard&) = delete;
 
-private:
+  private:
     SseStreamSession& s_;
 };
 

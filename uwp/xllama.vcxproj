@@ -35,17 +35,19 @@
     <WindowsTargetPlatformMinVersion>10.0.19041.0</WindowsTargetPlatformMinVersion>
   </PropertyGroup>
 
-  <!-- Backend selection: 'ort' (default, ORT GenAI text inference) or 'llamacpp'
+  <!-- Backend selection: 'unified' (default), 'ort' (ORT GenAI text inference) or 'llamacpp'
        (ggml/llama CPU backend from the submodule, XLLAMA_USE_ORT=0 — the CPU A/B
        lane; requires the submodule checked out + scripts/apply-uwp-patches.sh).
        Plain ORT (image spike, diffusion) stays linked in both. -->
   <PropertyGroup>
-    <XllamaBackend Condition="'$(XllamaBackend)' == ''">ort</XllamaBackend>
+    <XllamaBackend Condition="'$(XllamaBackend)' == ''">unified</XllamaBackend>
     <!-- The sources gate on `#ifdef XLLAMA_USE_ORT` / `#ifdef XLLAMA_USE_LLAMA`
          (not #if), so each macro must be ABSENT — not 0 — when its backend is off.
          ort: ORT only. llamacpp: llama only. unified: BOTH (runtime dispatch). -->
     <XllamaOrtDefine Condition="'$(XllamaBackend)' != 'llamacpp'">XLLAMA_USE_ORT=1;</XllamaOrtDefine>
     <XllamaLlamaDefine Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">XLLAMA_USE_LLAMA=1;</XllamaLlamaDefine>
+    <!-- Vision is part of every llama-enabled build, not an opt-in CI flag. -->
+    <XllamaMtmdDefine Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">XLLAMA_HAS_MTMD=1;</XllamaMtmdDefine>
     <!-- Lane B in-process training rides on the llama.cpp backend (ggml-opt). -->
     <XllamaDeviceTrainDefine Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">XLLAMA_DEVICE_TRAIN=1;</XllamaDeviceTrainDefine>
     <!-- Store SKU: strip research surfaces (LAN API, USB models, headless flags).
@@ -117,6 +119,7 @@
         $(ProjectDir)..\shaders\generated;
         $(ProjectDir)..\llama.cpp\include;
         $(ProjectDir)..\llama.cpp\ggml\include;
+        $(ProjectDir)..\llama.cpp\tools\mtmd;
         $(ProjectDir)packages\Microsoft.ML.OnnxRuntimeGenAI.DirectML.0.14.1\build\native\include;
         $(ProjectDir)packages\Microsoft.ML.OnnxRuntime.DirectML.1.24.4\build\native\include;
         %(AdditionalIncludeDirectories)
@@ -128,6 +131,7 @@
         XLLAMA_UWP=1;
         $(XllamaOrtDefine)
         $(XllamaLlamaDefine)
+        $(XllamaMtmdDefine)
         $(XllamaDeviceTrainDefine)
         $(XllamaStoreSkuDefine)
         %(PreprocessorDefinitions)
@@ -344,6 +348,7 @@
     <ClCompile Include="App.cpp" />
     <!-- LAN API is Dev Mode only; omit from Store SKU link (docs/store-readiness.md). -->
     <ClCompile Include="api-server.cpp" Condition="'$(XllamaStoreSku)' != 'true'" />
+    <ClCompile Include="vision_mtmd.cpp" />
     <ClCompile Include="chat-history.cpp" />
     <ClCompile Include="MainPage.cpp" />
     <ClCompile Include="model-downloader.cpp" />
@@ -354,6 +359,15 @@
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+
+  <Target Name="EnsureMtmdEnabled" BeforeTargets="PrepareForBuild"
+          Condition="'$(XllamaBackend)' == 'llamacpp' or '$(XllamaBackend)' == 'unified'">
+    <Error Condition="'$(XllamaMtmdDefine)' != 'XLLAMA_HAS_MTMD=1;'"
+           Text="The llama-enabled Xbox build requires XLLAMA_HAS_MTMD=1; vision must not silently compile out." />
+    <Error Condition="!Exists('$(ProjectDir)..\llama.cpp\tools\mtmd\mtmd-helper.h')"
+           Text="Pinned mtmd sources are missing. Initialize the recursive llama.cpp submodule before building." />
+    <Message Importance="high" Text="Vision enabled: XLLAMA_HAS_MTMD=1, vision_mtmd.cpp, static mtmd in ggml-uwp." />
+  </Target>
 
   <!-- NuGet package targets (restored to packages\ relative to this vcxproj) -->
   <Import Project="packages\Microsoft.Windows.CppWinRT.2.0.240405.15\build\native\Microsoft.Windows.CppWinRT.targets"

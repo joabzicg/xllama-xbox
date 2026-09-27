@@ -28,9 +28,19 @@ runs:
       if: inputs.variant == 'llamacpp' || inputs.variant == 'unified'
       shell: bash
       run: |
-        git submodule update --init --depth 1 llama.cpp
+        git submodule update --init --recursive --depth 1 llama.cpp
         bash scripts/apply-uwp-patches.sh
         bash scripts/check-uwp-sources.sh
+
+    - name: Verify host streaming and vision contracts
+      shell: pwsh
+      run: |
+        cmake -S tests/host -B build/host-contracts -A x64
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        cmake --build build/host-contracts --config Release --parallel 4
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        ctest --test-dir build/host-contracts -C Release --output-on-failure
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     - name: Restore NuGet packages
       shell: pwsh

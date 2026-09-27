@@ -2,7 +2,7 @@
 <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
 
   <!-- =====================================================================
-       ggml-uwp — static, CPU-only build of ggml + llama for the AppContainer.
+       ggml-uwp — static, CPU-only build of ggml + llama + mtmd for the AppContainer.
        Compiled from the llama.cpp submodule sources (patched via
        scripts/apply-uwp-patches.sh — three desktop-only APIs guarded, see
        patches/README.md). No dynamic backend loading (the CPU backend is
@@ -61,6 +61,9 @@
         $(ProjectDir)..\llama.cpp\ggml\include;
         $(ProjectDir)..\llama.cpp\ggml\src;
         $(ProjectDir)..\llama.cpp\ggml\src\ggml-cpu;
+        $(ProjectDir)..\llama.cpp;
+        $(ProjectDir)..\llama.cpp\vendor;
+        $(ProjectDir)..\llama.cpp\tools\mtmd;
         %(AdditionalIncludeDirectories)
       </AdditionalIncludeDirectories>
       <PreprocessorDefinitions>
@@ -72,7 +75,7 @@
         GGML_USE_CPU_REPACK;
         GGML_STATIC;
         GGML_VERSION=&quot;uwp-static&quot;;
-        GGML_COMMIT=&quot;9a532ae4b&quot;;
+        GGML_COMMIT=&quot;3cb7ffb&quot;;
         %(PreprocessorDefinitions)
       </PreprocessorDefinitions>
       <LanguageStandard>stdcpp17</LanguageStandard>
@@ -187,6 +190,27 @@
          automatically, matching the Linux CMake glob. This prevents the
          hardcoded-list drift that broke the build on the 657e011 bump. -->
     <ClCompile Include="..\llama.cpp\src\models\*.cpp" />
+  </ItemGroup>
+
+  <!-- Match tools/mtmd/CMakeLists.txt at the pinned submodule revision.
+       Keep the library in this static archive so ProjectReference links all
+       mtmd -> llama -> ggml dependencies. No CLI, ffmpeg, or subprocess support.
+       RelativeDir object names separate llama and mtmd model basenames. -->
+  <ItemGroup>
+    <ClCompile Include="..\llama.cpp\tools\mtmd\mtmd.cpp" />
+    <ClCompile Include="..\llama.cpp\tools\mtmd\mtmd-audio.cpp">
+      <!-- Must precede the transitive cmath include in mtmd-audio.h. -->
+      <PreprocessorDefinitions>_USE_MATH_DEFINES;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\llama.cpp\tools\mtmd\mtmd-image.cpp" />
+    <ClCompile Include="..\llama.cpp\tools\mtmd\mtmd-helper.cpp">
+      <!-- Audio decoding is memory-only; remove miniaudio's unused desktop
+           loader/thread helpers from this AppContainer translation unit. -->
+      <PreprocessorDefinitions>MA_NO_RUNTIME_LINKING;MA_NO_THREADING;MA_NO_WIN32_FILEIO;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="..\llama.cpp\tools\mtmd\mtmd-helper-gen.cpp" />
+    <ClCompile Include="..\llama.cpp\tools\mtmd\clip.cpp" />
+    <ClCompile Include="..\llama.cpp\tools\mtmd\models\*.cpp" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

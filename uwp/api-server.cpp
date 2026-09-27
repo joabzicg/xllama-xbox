@@ -19,11 +19,9 @@
 
     #include "inference-bridge.h"
     #include "model-downloader.h"
+    #include "vision_mtmd.h"
     #include "xllama/chat_prompt.h"
     #include "xllama/kv_continuation.h"
-    #include "xllama/vision.h"
-    #include "vision_mtmd.h"
-    #include "xllama/sse.h"
     #include "xllama/model_provision.h"
     #include "xllama/path_utils.h"
     #include "xllama/personalize.h"
@@ -33,18 +31,23 @@
     #include "xllama/routing_policy.h"
     #include "xllama/session.h"
     #include "xllama/session_hub.h"
+    #include "xllama/sse.h"
     #include "xllama/utf8_utils.h"
+    #include "xllama/vision.h"
 
     #include <algorithm>
     #include <atomic>
     #include <cctype>
-    #include <thread>
+    #include <charconv>
+    #include <cmath>
     #include <cstdio>
     #include <ctime>
     #include <filesystem>
     #include <memory>
     #include <mutex>
+    #include <stdexcept>
     #include <string>
+    #include <thread>
     #include <vector>
 
 namespace xllama::api {
@@ -138,6 +141,7 @@ struct HttpRequest {
     std::string body;
     bool ok = false;
     bool chunked = false; // Transfer-Encoding: chunked (unsupported framing)
+    bool too_large = false;
 };
 
 std::string to_lower(std::string s) {
@@ -194,9 +198,23 @@ HttpRequest read_request(StreamSocket const& socket) {
         }
         const size_t cl = headers.find("content-length:");
         if (cl != std::string::npos) {
-            content_length = static_cast<size_t>(std::atoll(headers.c_str() + cl + 15));
-            if (content_length > 8 * 1024 * 1024)
-                content_length = 8 * 1024 * 1024; // hard cap
+            size_t start = cl + 15;
+            while (start < headers.size() && (headers[start] == ' ' || headers[start] == '\t'))
+                ++start;
+            size_t end = headers.find("\r\n", start);
+            if (end == std::string::npos)
+                end = headers.size();
+            while (end > start && (headers[end - 1] == ' ' || headers[end - 1] == '\t'))
+                --end;
+            const auto parsed =
+                std::from_chars(headers.data() + start, headers.data() + end, content_length);
+            if (parsed.ec != std::errc{} || parsed.ptr != headers.data() + end)
+                return req;
+            // 32 MiB of compressed images expands to ~43 MiB in base64, plus JSON/text.
+            if (content_length > 48u * 1024u * 1024u) {
+                req.too_large = req.ok = true;
+                return req; // reject before allocating/reading the oversized body
+            }
         }
     }
 
@@ -208,6 +226,8 @@ HttpRequest read_request(StreamSocket const& socket) {
         for (uint32_t i = 0; i < got; ++i)
             data.push_back(static_cast<char>(reader.ReadByte()));
     }
+    if (data.size() - body_start < content_length)
+        return req;
     req.body = data.substr(body_start, content_length);
     req.ok = true;
     return req;
@@ -305,10 +325,10 @@ CatalogueSessionPolicy catalogue_session_policy(const std::string& model) {
 // Turn the OpenAI messages[] into (system, history, final_user) for render_prompt.
 // Parse one message's content into ORDERED parts (text/image in original order).
 // Image parts are decoded via the pure vision core: data URLs -> compressed bytes +
-// magic-byte MIME; unsupported/undecodable parts are dropped. Size limits are checked
+// magic-byte MIME; unsupported/undecodable parts are rejected. Size limits are checked
 // BEFORE base64 allocation (Xbox OOM guard). Text-only messages yield a single text part.
-std::vector<::xllama::vision::Part> parse_content_parts(JsonValue const& content_val,
-                                                         size_t& total_image_bytes) {
+std::vector<::xllama::vision::Part> parse_content_parts(IJsonValue const& content_val,
+                                                        size_t& total_image_bytes) {
     std::vector<::xllama::vision::Part> parts;
     if (content_val.ValueType() == JsonValueType::String) { // plain string content
         ::xllama::vision::Part p;
@@ -318,10 +338,10 @@ std::vector<::xllama::vision::Part> parse_content_parts(JsonValue const& content
         return parts;
     }
     if (content_val.ValueType() != JsonValueType::Array)
-        return parts;
+        throw std::invalid_argument("message content must be text or an array of content parts");
     for (auto&& el : content_val.GetArray()) {
         if (el.ValueType() != JsonValueType::Object)
-            continue;
+            throw std::invalid_argument("content parts must be objects");
         JsonObject part = el.GetObject();
         const std::string type = winrt::to_string(part.GetNamedString(L"type", L""));
         if (type == "text") {
@@ -330,28 +350,33 @@ std::vector<::xllama::vision::Part> parse_content_parts(JsonValue const& content
             p.text = winrt::to_string(part.GetNamedString(L"text", L""));
             parts.push_back(std::move(p));
         } else if (type == "image_url") {
-            JsonObject iu = part.HasKey(L"image_url") ? part.GetNamedObject(L"image_url") : JsonObject{nullptr};
+            JsonObject iu =
+                part.HasKey(L"image_url") ? part.GetNamedObject(L"image_url") : JsonObject{nullptr};
             if (!iu)
-                continue;
+                throw std::invalid_argument("image_url must contain a URL object");
             const std::string url = winrt::to_string(iu.GetNamedString(L"url", L""));
             ::xllama::vision::Part p;
             p.kind = ::xllama::vision::Kind::Image;
-            p.url = url;
             // Data URLs decoded here (required path). Enforce size limits BEFORE alloc:
             // bound the encoded payload, then verify magic bytes after decode.
-            if (::xllama::vision::parse_data_url(url, p.bytes, p.mime)) {
-                if (!::xllama::vision::mime_supported(p.mime) || !::xllama::vision::size_ok(total_image_bytes, p.bytes.size()))
-                    continue; // unsupported MIME / over budget -> drop
+            const size_t remaining = ::xllama::vision::kMaxTotalImageBytes - total_image_bytes;
+            if (::xllama::vision::parse_data_url(
+                    url, p.bytes, p.mime,
+                    (std::min)(::xllama::vision::kMaxImageBytes, remaining))) {
+                if (!::xllama::vision::mime_supported(p.mime) ||
+                    !::xllama::vision::size_ok(total_image_bytes, p.bytes.size()))
+                    throw std::invalid_argument("image payload exceeds the request budget");
                 total_image_bytes += p.bytes.size();
             } else if (::xllama::vision::is_http_url(url)) {
-                // Remote http(s)/file URL: OPTIONAL path. No network-fetch subsystem is
-                // added here (would complicate UWP); the URL is carried for a caller that
-                // can fetch, but with no bytes it cannot be encoded -> dropped from bitmaps.
-                continue;
+                throw std::invalid_argument(
+                    "remote image URLs are unsupported; send a base64 data URL");
             } else {
-                continue; // undecodable
+                throw std::invalid_argument("invalid, unsupported, or oversized image data URL; "
+                                            "MIME must match image bytes");
             }
             parts.push_back(std::move(p));
+        } else {
+            throw std::invalid_argument("unsupported message content part: " + type);
         }
     }
     return parts;
@@ -366,12 +391,23 @@ void split_messages(JsonArray const& messages, std::string& system,
                     std::vector<::xllama::ChatTurn>& history, std::string& final_user,
                     std::vector<::xllama::vision::Part>& images) {
     size_t total_image_bytes = 0;
-    auto render_role = [&](JsonValue const& c) -> std::string {
+    bool has_literal_marker = false;
+    auto render_role = [&](IJsonValue const& c, const std::string& role) -> std::string {
         auto parts = parse_content_parts(c, total_image_bytes);
-        ::xllama::vision::RenderedMessage r = ::xllama::vision::render_ordered("", parts);
-        for (auto* b : r.bitmaps)
-            images.push_back(*b); // ordered; index matches marker order
-        return r.text_with_markers;
+        std::string rendered;
+        for (auto& part : parts) {
+            if (part.kind == ::xllama::vision::Kind::Text) {
+                has_literal_marker |=
+                    part.text.find(::xllama::vision_mtmd::vision_marker()) != std::string::npos;
+                rendered += part.text;
+            } else {
+                if (role != "user")
+                    throw std::invalid_argument("images are supported in user messages only");
+                rendered += ::xllama::vision_mtmd::vision_marker();
+                images.push_back(std::move(part));
+            }
+        }
+        return rendered;
     };
     std::string cur_user;
     bool have_user = false;
@@ -380,7 +416,9 @@ void split_messages(JsonArray const& messages, std::string& system,
         const std::string role = winrt::to_string(m.GetNamedString(L"role", L""));
         if (!m.HasKey(L"content"))
             continue;
-        const std::string content = render_role(m.GetNamedValue(L"content"));
+        if (role != "system" && role != "user" && role != "assistant")
+            throw std::invalid_argument("unsupported message role: " + role);
+        const std::string content = render_role(m.GetNamedValue(L"content"), role);
         if (role == "system") {
             if (!system.empty())
                 system += "\n";
@@ -399,6 +437,8 @@ void split_messages(JsonArray const& messages, std::string& system,
     }
     if (have_user)
         final_user = cur_user; // trailing user turn is the one we answer
+    if (!images.empty() && has_literal_marker)
+        throw std::invalid_argument("literal media markers are not allowed in image request text");
 }
 
 // ---------------------------------------------------------------------------
@@ -414,46 +454,11 @@ void split_messages(JsonArray const& messages, std::string& system,
 std::string image_fingerprint(const std::vector<::xllama::vision::Part>& images) {
     std::string fp;
     for (const auto& p : images)
-        if (!p.bytes.empty()) { fp += std::to_string(::xllama::vision::fnv1a(p.bytes)); fp += ':'; }
+        if (!p.bytes.empty()) {
+            fp += std::to_string(::xllama::vision::fnv1a(p.bytes));
+            fp += ':';
+        }
     return fp;
-}
-
-// Vision prefill hook. NO-OP (returns true) when the request has no images, so the
-// text-only path is byte-identical to before. When images ARE present: with mtmd linked,
-// open/reuse an mtmd context on the resident Session's llama_model and prefill the
-// ordered text+markers + bitmaps into its shared KV (Fast/Detailed preset bounds); without
-// mtmd, return a clean error so behaviour is safe and explicit. Vision forces full prefill
-// upstream (KV image-fingerprint guard), so there is no reused-KV/marker interaction.
-bool apply_vision_prefill(ChatPrep& p, const char*& status, std::string& err) {
-    if (!p.had_images)
-        return true; // text-only fast path — untouched
-#ifdef XLLAMA_HAS_MTMD
-    if (p.session->llama_model_ptr() == nullptr) { // ORT backend has no mtmd support
-        status = "501 Not Implemented";
-        err = error_json("vision requires the llama.cpp (GGUF) backend");
-        return false;
-    }
-    const bool detailed = ::xllama::read_local_int("vision-preset.txt", 0) == 1; // 0=Fast,1=Detailed
-    static void* g_vision_model = nullptr;           // cache one mtmd ctx per model
-    static ::xllama::vision_mtmd::VisionCtx g_vctx;
-    if (g_vision_model != p.session->llama_model_ptr()) {
-        ::xllama::vision_mtmd::vision_close(g_vctx);
-        g_vctx = ::xllama::vision_mtmd::vision_open(p.session->llama_model_ptr(),
-                                                     p.session->mmproj_path(), detailed);
-        g_vision_model = p.session->llama_model_ptr();
-    }
-    auto r = ::xllama::vision_mtmd::vision_prefill(g_vctx, p.session->llama_context_ptr(), 0,
-                                                    p.prompt_for_generate, p.images);
-    if (!r.ok) { status = "500 Internal Server Error"; err = error_json("vision: " + r.error); return false; }
-    // mtmd advanced n_past over the text+image chunks; generation must CONTINUE from
-    // there (generate_from_prefilled), never re-tokenize/re-decode the prompt.
-    p.multimodal_prefilled = true;
-    return true;
-#else
-    status = "501 Not Implemented";
-    err = error_json("vision not compiled (built without libmtmd)");
-    return false;
-#endif
 }
 
 // Params that invalidate KV reuse — EXACTLY Session::sampling_matches()'s set
@@ -461,9 +466,13 @@ bool apply_vision_prefill(ChatPrep& p, const char*& status, std::string& err) {
 // rebuild its persistent generator, so we must NOT claim a continuation.
 std::string params_fingerprint(const ::xllama::GenerateParams& gp) {
     char buf[128];
-    std::snprintf(buf, sizeof(buf), "t=%g|p=%g|k=%d|r=%g", static_cast<double>(gp.temperature),
-                  static_cast<double>(gp.top_p), gp.top_k, static_cast<double>(gp.repetition_penalty));
-    return buf;
+    std::snprintf(buf, sizeof(buf), "t=%.9g|p=%.9g|k=%d|r=%.9g|seed=%u|n=%d",
+                  static_cast<double>(gp.temperature), static_cast<double>(gp.top_p), gp.top_k,
+                  static_cast<double>(gp.repetition_penalty), gp.seed, gp.n_predict);
+    std::string fingerprint(buf);
+    for (const auto& stop : gp.stop_sequences)
+        fingerprint += "|stop=" + std::to_string(stop.size()) + ":" + stop;
+    return fingerprint;
 }
 
 // Per-conversation KV memory for the LAN API. Guarded by session_hub().mtx (the
@@ -474,13 +483,15 @@ std::string params_fingerprint(const ::xllama::GenerateParams& gp) {
 struct ApiKvMemory {
     ::xllama::kv::ConvState prev;
     uint64_t primed_generation = 0;
-    bool valid = false;          // a prior API turn primed KV on the current generation
+    uint64_t primed_revision = 0;      // GUI/state restore may alter KV without a model swap
+    bool valid = false;                // a prior API turn primed KV on the current generation
     bool prev_ended_with_stop = false; // render_delta() needs the previous turn's verdict
 };
 ApiKvMemory g_kv_memory;
 
 // Everything both response paths need, parsed once.
 struct ChatPrep {
+    std::string id;
     std::string model;
     std::string system;
     std::string final_user;
@@ -488,22 +499,69 @@ struct ChatPrep {
     ::xllama::Session* session = nullptr;
     ::xllama::ChatFormat fmt;
     std::vector<::xllama::vision::Part> images; // multimodal parts (empty = text-only fast path)
-    bool had_images = false;                    // forces full prefill (no KV reuse across image ctx)
+    bool had_images = false; // forces full prefill (no KV reuse across image ctx)
     // Set by apply_vision_prefill when this request actually ran mtmd prefill into the
     // shared context. The generate call sites then continue-from-prefilled (sample from
     // where mtmd left n_past) instead of re-tokenizing/re-decoding the prompt.
     bool multimodal_prefilled = false;
+    bool vision_detailed = false;
+    ::xllama::PrefilledContext prefill;
     ::xllama::GenerateParams gp;
     // KV decision resolved in prepare_chat:
-    bool kv_reuse = false;   // -> reuse_kv
-    bool kv_reset = true;    // -> reset_kv
+    bool kv_reuse = false;           // -> reuse_kv
+    bool kv_reset = true;            // -> reset_kv
     std::string prompt_for_generate; // delta on reuse, full prompt otherwise
     ::xllama::kv::ConvState kv_cur;  // snapshot for commit_kv after generation
 };
 
+// Prefill once on the resident llama context. The request owns the projector context,
+// so a model swap or preset change cannot reuse a stale pointer or stale token bounds.
+bool apply_vision_prefill(ChatPrep& p, const char*& status, std::string& err) {
+    if (!p.had_images)
+        return true;
+    #ifdef XLLAMA_HAS_MTMD
+    if (!p.session->llama_model_ptr()) {
+        status = "501 Not Implemented";
+        err = error_json("vision requires the llama.cpp (GGUF) backend");
+        return false;
+    }
+    const std::string projector = p.session->mmproj_path();
+    if (projector.empty()) {
+        status = "400 Bad Request";
+        err = error_json(
+            "vision requires exactly one matching mmproj GGUF beside the language model");
+        return false;
+    }
+    std::string preparation_error;
+    if (!p.session->prepare_multimodal(&preparation_error)) {
+        status = "500 Internal Server Error";
+        err = error_json("vision: " + preparation_error);
+        return false;
+    }
+    auto vctx = ::xllama::vision_mtmd::vision_open(p.session->llama_model_ptr(), projector,
+                                                   p.vision_detailed);
+    auto r = ::xllama::vision_mtmd::vision_prefill(vctx, p.session->llama_context_ptr(), 0,
+                                                   p.prompt_for_generate, p.images, p.gp.n_predict);
+    if (!r.ok) {
+        status = "400 Bad Request";
+        err = error_json("vision: " + r.error);
+        return false;
+    }
+    p.prefill = r.prefill;
+    p.multimodal_prefilled = true;
+    return true;
+    #else
+    status = "501 Not Implemented";
+    err = error_json("vision not compiled (built without libmtmd)");
+    return false;
+    #endif
+}
+
 // Returns true on success (prep filled); on failure sets *status and returns the
 // error JSON body in *err. Must be called with session_hub().mtx held.
 bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std::string& err) {
+    p.id =
+        "chatcmpl-xllama-" + std::to_string(time(nullptr)) + "-" + std::to_string(++g_req_counter);
     JsonObject root{nullptr};
     if (!JsonObject::TryParse(winrt::to_hstring(body), root) || root == nullptr) {
         status = "400 Bad Request";
@@ -526,8 +584,29 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
         err = error_json("missing or non-array 'messages'");
         return false;
     }
-    split_messages(root.GetNamedArray(L"messages"), p.system, p.history, p.final_user, p.images);
+    try {
+        split_messages(root.GetNamedArray(L"messages"), p.system, p.history, p.final_user,
+                       p.images);
+    } catch (const std::invalid_argument& e) {
+        status = "400 Bad Request";
+        err = error_json(e.what());
+        return false;
+    } catch (const winrt::hresult_error&) {
+        status = "400 Bad Request";
+        err = error_json("invalid message or content-part field type");
+        return false;
+    }
     p.had_images = !p.images.empty(); // any image -> forces full prefill (no KV reuse across media)
+    if (p.had_images) {
+        const std::string preset = winrt::to_string(root.GetNamedString(L"vision_preset", L""));
+        if (!preset.empty() && preset != "fast" && preset != "detailed") {
+            status = "400 Bad Request";
+            err = error_json("vision_preset must be fast or detailed");
+            return false;
+        }
+        p.vision_detailed =
+            preset.empty() ? read_local_text("vision-preset.txt") == "1" : preset == "detailed";
+    }
     if (p.final_user.empty()) {
         status = "400 Bad Request";
         err = error_json("no user message to complete");
@@ -560,25 +639,36 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
     p.fmt = ::xllama::chat_format_for(p.model);
     p.gp.stop_sequences = p.fmt.stop_sequences;
     p.gp.n_predict = 512;
-    if (root.HasKey(L"max_completion_tokens"))
-        p.gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_completion_tokens"));
-    else if (root.HasKey(L"max_tokens"))
-        p.gp.n_predict = static_cast<int>(root.GetNamedNumber(L"max_tokens"));
+    const double requested_tokens = root.HasKey(L"max_completion_tokens")
+                                        ? root.GetNamedNumber(L"max_completion_tokens")
+                                        : root.GetNamedNumber(L"max_tokens", 512);
+    if (!std::isfinite(requested_tokens) || requested_tokens < 1 ||
+        requested_tokens >= policy_n_ctx || std::floor(requested_tokens) != requested_tokens) {
+        status = "400 Bad Request";
+        err = error_json("max_tokens must be positive and smaller than the model context");
+        return false;
+    }
+    p.gp.n_predict = static_cast<int>(requested_tokens);
 
     // Prompt budget (same primitive as the chat UI). `fit.dropped > 0` marks that
     // we had to trim — which invalidates any KV prefix from a prior turn.
     bool trimmed = false;
     std::string full_prompt;
-    {
+    if (p.had_images) {
+        // mtmd counts image embeddings, which the text tokenizer cannot budget.
+        // Keep all markers and their bitmaps together; reject over-capacity chunks
+        // before evaluation rather than trimming only one side of the association.
+        full_prompt = p.fmt.render_prompt(p.system, p.history, p.final_user);
+    } else {
         const ::xllama::PromptFit fit = ::xllama::fit_prompt(
             p.fmt, p.system, p.history, p.final_user, policy_n_ctx, p.gp.n_predict,
             [session = p.session](const std::string& text) { return session->count_tokens(text); });
         if (!fit.fits) {
             status = "400 Bad Request";
             err = error_json("prompt too long: the final user message needs " +
-                              std::to_string(fit.n_tokens) + " tokens plus " +
-                              std::to_string(p.gp.n_predict) + " for the reply, but n_ctx is " +
-                              std::to_string(policy_n_ctx));
+                             std::to_string(fit.n_tokens) + " tokens plus " +
+                             std::to_string(p.gp.n_predict) + " for the reply, but n_ctx is " +
+                             std::to_string(policy_n_ctx));
             return false;
         }
         if (fit.dropped > 0) {
@@ -610,8 +700,9 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
     // ---- KV-reuse decision (guarded by hub.mtx, held by caller) ----
     // A model swap bumps hub.generation; if it moved since we primed, the resident
     // session is a different one and any remembered prefix is stale.
-    const bool primed_on_this_generation = g_kv_memory.valid && g_kv_memory.primed_generation ==
-                                                                                   ::xllama::session_hub().generation;
+    const bool primed_on_this_generation =
+        g_kv_memory.valid && g_kv_memory.primed_generation == ::xllama::session_hub().generation &&
+        g_kv_memory.primed_revision == p.session->kv_revision();
     ::xllama::kv::ConvState cur;
     cur.model = p.model;
     cur.system = p.system;
@@ -650,7 +741,32 @@ bool prepare_chat(const std::string& body, ChatPrep& p, const char*& status, std
     // Stash the current conversation snapshot so the response path can commit it
     // after generation (needs the assistant output + ended_with_stop).
     p.kv_cur = cur;
+    ::xllama::log_output("[xllama] api: request=" + p.id +
+                         " kv=" + (p.kv_reset ? "reset" : "reuse") +
+                         " images=" + std::to_string(p.images.size()) + "\n");
     return true;
+}
+
+bool prepare_chat_safe(const std::string& body, ChatPrep& p, const char*& status,
+                       std::string& err) {
+    try {
+        return prepare_chat(body, p, status, err);
+    } catch (const winrt::hresult_error&) {
+        status = "400 Bad Request";
+        err = error_json("malformed request field type");
+        return false;
+    }
+}
+
+void log_chat_result(const ChatPrep& p, const ::xllama::InferenceResult& r, bool streaming,
+                     bool aborted) {
+    char metrics[256];
+    std::snprintf(metrics, sizeof(metrics),
+                  " stream=%d aborted=%d prompt_tokens=%d prefill_ms=%.1f decode_tokens=%d "
+                  "decode_ms=%.1f peak_ws_mb=%zu\n",
+                  streaming, aborted, r.n_p_eval, r.t_p_eval_ms, r.n_eval, r.t_eval_ms,
+                  ::xllama::peak_working_set_mb());
+    ::xllama::log_output("[xllama] api: request=" + p.id + metrics);
 }
 
 // Commit KV memory after a successful turn: fold this exchange into history and
@@ -667,6 +783,7 @@ void commit_kv(const ChatPrep& p, const std::string& assistant_output, bool ende
     prev.primed = true;
     prev.image_fingerprint = image_fingerprint(p.images);
     g_kv_memory.primed_generation = ::xllama::session_hub().generation;
+    g_kv_memory.primed_revision = p.session->kv_revision();
     g_kv_memory.valid = true;
     g_kv_memory.prev_ended_with_stop = ended_with_stop;
 }
@@ -677,16 +794,18 @@ void commit_kv(const ChatPrep& p, const std::string& assistant_output, bool ende
 std::string handle_chat_locked(const std::string& body, const char*& status) {
     ChatPrep p;
     std::string err;
-    if (!prepare_chat(body, p, status, err))
+    if (!prepare_chat_safe(body, p, status, err))
         return err;
+    g_kv_memory.valid = false; // failures must not leave an earlier turn marked reusable
     if (!apply_vision_prefill(p, status, err)) // no-op unless the request carries images
         return err;
 
     // Multimodal turns were already prefilled by mtmd into the shared context; continue
     // from that state (no re-tokenize/re-decode). Text-only turns use the normal path.
     const ::xllama::InferenceResult r = p.multimodal_prefilled
-                                            ? p.session->generate_from_prefilled(p.gp)
+                                            ? p.session->generate_from_prefilled(p.gp, p.prefill)
                                             : p.session->generate(p.gp);
+    log_chat_result(p, r, false, !r.success);
     if (!r.success) {
         status = "500 Internal Server Error";
         return error_json("generation failed: " + r.error_msg);
@@ -718,8 +837,7 @@ std::string handle_chat_locked(const std::string& body, const char*& status) {
 
     JsonObject resp;
     // Unique per response (id is keyed by clients / trace dedup). hub.mtx is held.
-    const std::string id =
-        "chatcmpl-xllama-" + std::to_string(time(nullptr)) + "-" + std::to_string(++g_req_counter);
+    const std::string& id = p.id;
     resp.Insert(L"id", JsonValue::CreateStringValue(winrt::to_hstring(id)));
     resp.Insert(L"object", JsonValue::CreateStringValue(L"chat.completion"));
     resp.Insert(L"created", JsonValue::CreateNumberValue(static_cast<double>(time(nullptr))));
@@ -753,10 +871,11 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
     ChatPrep p;
     const char* status = "200 OK";
     std::string err;
-    if (!prepare_chat(body, p, status, err)) {
+    if (!prepare_chat_safe(body, p, status, err)) {
         write_response(socket, status, err); // error before any SSE bytes: plain JSON
         return;
     }
+    g_kv_memory.valid = false;
     if (!apply_vision_prefill(p, status, err)) { // no-op unless the request carries images
         write_response(socket, status, err);
         return;
@@ -779,12 +898,16 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
             writer.FlushAsync().get();
         } catch (...) {
             alive = false; // client gone -> sink failure -> session sets abort_flag
+            ::xllama::log_output("[xllama] api: request=" + p.id +
+                                 " stream-abort: socket write failed\n");
         }
     };
-    auto sink = [&](const std::string& framed) { write_raw(framed); return alive; };
+    auto sink = [&](const std::string& framed) {
+        write_raw(framed);
+        return alive;
+    };
 
-    const std::string id =
-        "chatcmpl-xllama-" + std::to_string(time(nullptr)) + "-" + std::to_string(++g_req_counter);
+    const std::string& id = p.id;
     const long long created = static_cast<long long>(time(nullptr));
 
     // SSE response headers first (writer thread, before any event).
@@ -794,8 +917,8 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
 
     ::xllama::sse::SseStreamSession session(id, p.model, created, p.gp.stop_sequences,
                                             std::move(sink));
-    ::xllama::sse::SseCloseGuard guard(session); // unconditional close on every exit path
-    p.gp.abort_flag = session.abort_flag();      // decode loop checks this every iteration
+    ::xllama::sse::SseCloseGuard guard(session);  // unconditional close on every exit path
+    p.gp.abort_flag = session.abort_flag();       // decode loop checks this every iteration
     p.gp.on_token = [&](std::string_view piece) { // PRODUCER: enqueue only, never touch socket
         session.on_token(piece);
     };
@@ -807,15 +930,22 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
     ::xllama::InferenceResult r;
     bool gen_ok = false;
     std::thread producer([&]() {
-        winrt::init_apartment(winrt::apartment_type::multi_threaded); // defensive; no WinRT calls here
         try {
+            winrt::init_apartment(winrt::apartment_type::multi_threaded);
+            struct ApartmentGuard {
+                ~ApartmentGuard() {
+                    winrt::uninit_apartment();
+                }
+            } apartment;
             // Multimodal turns were prefilled by mtmd into the shared context; continue
             // from there (no re-tokenize/re-decode). Text-only uses the normal path.
-            r = p.multimodal_prefilled ? p.session->generate_from_prefilled(p.gp)
+            r = p.multimodal_prefilled ? p.session->generate_from_prefilled(p.gp, p.prefill)
                                        : p.session->generate(p.gp);
             gen_ok = r.success && !session.abort_flag()->load();
             if (gen_ok)
-                session.finish(r.ended_with_stop); // flush tail + finish_reason + [DONE] + close
+                session.finish(r.ended_with_stop,
+                               r.n_eval <
+                                   p.gp.n_predict); // flush tail + finish_reason + [DONE] + close
             else
                 session.close(); // generation failed/aborted: wake the drain loop
         } catch (...) {
@@ -823,12 +953,25 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
         }
     });
 
+    struct ProducerGuard {
+        std::thread& thread;
+        ::xllama::sse::SseStreamSession& stream;
+        ~ProducerGuard() {
+            stream.abort_flag()->store(true);
+            stream.close();
+            if (thread.joinable())
+                thread.join();
+        }
+    } producer_guard{producer, session};
+
     // ---- Writer drains concurrently (the ONLY place StoreAsync/FlushAsync run) ----
     std::string frame;
-    while (session.drain_one_blocking(frame))
-        write_raw(frame); // sink runs here, on the writer thread
+    while (session.drain_one_blocking(frame)) {
+        // drain_one_blocking invokes the sink exactly once on this writer thread.
+    }
 
     producer.join(); // generation thread must finish before we tear down
+    log_chat_result(p, r, true, !gen_ok || session.abort_flag()->load() || !alive);
     try {
         writer.DetachStream();
     } catch (...) {
@@ -836,7 +979,7 @@ void handle_chat_streaming(StreamSocket const& socket, const std::string& body) 
 
     // Commit KV only on a clean completion; an abort/disconnect leaves a partial turn,
     // so force a full prefill next time rather than a corrupt continuation.
-    if (gen_ok)
+    if (gen_ok && !session.abort_flag()->load() && alive)
         commit_kv(p, p.fmt.postprocess_output(r.output_text), r.ended_with_stop);
     else
         g_kv_memory.valid = false;
@@ -1137,6 +1280,11 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
             write_response(socket, "400 Bad Request", error_json("malformed request"));
             return;
         }
+        if (req.too_large) {
+            write_response(socket, "413 Payload Too Large",
+                           error_json("request body exceeds 48 MiB"));
+            return;
+        }
         if (req.chunked) {
             write_response(
                 socket, "411 Length Required",
@@ -1199,7 +1347,7 @@ void handle_connection(StreamSocket const& socket, uint64_t generation) {
                     ::xllama::log_output(buf);
                 } catch (const std::exception& e) {
                     ::xllama::log_output(std::string("[xllama] api: stream error: ") + e.what() +
-                                        "\n");
+                                         "\n");
                 }
                 return;
             }

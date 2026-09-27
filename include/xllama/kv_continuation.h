@@ -24,26 +24,24 @@
 
 #pragma once
 
+#include "xllama/chat_prompt.h"
 #include <string>
 #include <vector>
 
 namespace xllama {
 namespace kv {
 
-struct Turn {
-    std::string user;
-    std::string assistant; // what the model actually produced last turn
-};
+using Turn = ::xllama::ChatTurn;
 
 // A conversation as the API understands it, in already-rendered / canonical form.
 struct ConvState {
     std::string model;
     std::string system;
-    std::string params_fp;              // fingerprint of every setting that changes KV
-    std::vector<Turn> history;          // completed exchanges BEFORE the final user turn
-    std::string final_user;             // the turn to answer now
-    bool trimmed = false;               // prompt was shortened to fit n_ctx this request
-    bool primed = false;                // a prior reuse-capable turn primed the Session
+    std::string params_fp;     // fingerprint of every setting that changes KV
+    std::vector<Turn> history; // completed exchanges BEFORE the final user turn
+    std::string final_user;    // the turn to answer now
+    bool trimmed = false;      // prompt was shortened to fit n_ctx this request
+    bool primed = false;       // a prior reuse-capable turn primed the Session
     // Multimodal identity: an ordered fingerprint of every image in the conversation
     // (FNV-1a over each bitmap's bytes, joined). Empty == text-only. KV is only reused
     // when this EXACTLY matches the previous turn's — a changed/added/removed image means
@@ -52,9 +50,9 @@ struct ConvState {
 };
 
 struct Decision {
-    bool reuse = false;   // -> GenerateParams::reuse_kv
-    bool reset = true;    // -> GenerateParams::reset_kv (true on any non-continuation)
-    std::string reason;   // human-readable, logged for measurement/observability
+    bool reuse = false; // -> GenerateParams::reuse_kv
+    bool reset = true;  // -> GenerateParams::reset_kv (true on any non-continuation)
+    std::string reason; // human-readable, logged for measurement/observability
 };
 
 inline bool same_history(const std::vector<Turn>& a, const std::vector<Turn>& b) {
@@ -81,6 +79,10 @@ inline Decision decide(const ConvState& prev, const ConvState& cur) {
         d.reuse = false;
         d.reset = true;
         d.reason = "first-turn";
+        return d;
+    }
+    if (!cur.primed) {
+        d.reason = "session-changed";
         return d;
     }
     if (prev.model != cur.model) {

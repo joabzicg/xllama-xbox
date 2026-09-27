@@ -56,6 +56,9 @@ struct SessionParams {
     // ORT sessions ignore this field. Hybrid caches that refuse tail rewind
     // disable speculation at runtime for that generation (no KV corruption).
     bool prompt_lookup = false;
+
+    // Multimodal vision projector GGUF (llama.cpp only). Empty = auto-detect in model dir.
+    std::string mmproj_path;
 };
 
 struct GenerateParams {
@@ -120,6 +123,15 @@ struct GenerateParams {
     std::atomic<bool>* abort_flag = nullptr;
 };
 
+// Exact result of an external multimodal prefill. Image embeddings consume KV
+// cells independently of M-RoPE positions: n_tokens is capacity, next_position
+// is the position of the first generated token. Never infer one from the other.
+struct PrefilledContext {
+    int n_tokens = 0;
+    int next_position = 0;
+    double prefill_ms = 0;
+};
+
 // Session owns the loaded model and tokenizer.
 // Thread safety: generate() must not be called concurrently.
 struct Session {
@@ -155,8 +167,25 @@ struct Session {
     // mtmd context can be opened on top (mtmd requires a llama_model*; the ORT
     // backend returns null → vision unsupported on that backend). Returned as void*
     // so this header need not pull in llama.h. Callers cast back under XLLAMA_HAS_MTMD.
-    virtual void* llama_model_ptr() { return nullptr; }
-    virtual void* llama_context_ptr() { return nullptr; }
+    virtual void* llama_model_ptr() {
+        return nullptr;
+    }
+    virtual void* llama_context_ptr() {
+        return nullptr;
+    }
+    // Changes on every operation that can mutate resident KV, including GUI
+    // turns on a session shared with the LAN API. Read under the session lock.
+    uint64_t kv_revision() const {
+        return m_kv_revision;
+    }
+
+    // Create the shared context and discard prior text KV/sampler bookkeeping
+    // before external mtmd evaluation. The caller holds the session lock.
+    virtual bool prepare_multimodal(std::string* err = nullptr) {
+        if (err)
+            *err = "multimodal prefill not supported by this backend";
+        return false;
+    }
 
     // Continue generation from the CURRENT KV end WITHOUT re-tokenizing/re-prefilling
     // gp.prompt. The multimodal caller has ALREADY evaluated the templated text + image
@@ -165,14 +194,18 @@ struct Session {
     // marker as plain text — double evaluation + position corruption. This runs only the
     // sampler + decode loop, sampling from the logits the last eval left. Default =
     // unsupported (non-llama backends). Not used by text-only turns; those keep generate().
-    virtual InferenceResult generate_from_prefilled(const GenerateParams& gp) {
+    virtual InferenceResult generate_from_prefilled(const GenerateParams& gp,
+                                                    const PrefilledContext& prefill) {
         (void)gp;
+        (void)prefill;
         InferenceResult r;
         r.error_msg = "prefill-continue not supported by this backend";
         return r;
     }
     // Path to the model's mmproj GGUF (empty → no vision). llama.cpp backend only.
-    virtual std::string mmproj_path() const { return {}; }
+    virtual std::string mmproj_path() const {
+        return {};
+    }
 
     virtual bool save_state(const std::string& path, std::string* err = nullptr) {
         (void)path;
@@ -188,6 +221,9 @@ struct Session {
     }
 
     virtual ~Session() = default;
+
+  protected:
+    uint64_t m_kv_revision = 0;
 };
 
 } // namespace xllama

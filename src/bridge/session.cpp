@@ -271,6 +271,7 @@ class OrtSession final : public Session {
     }
 
     InferenceResult generate(const GenerateParams& gp) override {
+        ++m_kv_revision;
         InferenceResult res;
         install_se_translator();
         try {
@@ -452,19 +453,39 @@ class LlamaSession final : public Session {
     // error — and on the model not using SWA, where the resident window is
     // not [0, kv_len) and the shift arithmetic below would lie.
     bool m_can_shift = false;
+    bool m_multimodal_pending = false;
+    std::string m_mmproj_path;
 
     explicit LlamaSession(LlamaModelPtr model, LlamaAdapterLoraPtr adapter, float lora_scale,
                           int n_ctx, int n_threads, int n_batch, int n_ubatch, bool kv_q8,
-                          bool prompt_lookup)
+                          bool prompt_lookup, std::string mmproj_path)
         : m_model(std::move(model)), m_adapter(std::move(adapter)), m_lora_scale(lora_scale),
           m_n_ctx(n_ctx), m_n_threads(n_threads), m_n_batch(n_batch), m_n_ubatch(n_ubatch),
-          m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup) {}
+          m_kv_q8(kv_q8), m_prompt_lookup(prompt_lookup), m_mmproj_path(std::move(mmproj_path)) {}
 
     // Multimodal seam (see Session base). llama.cpp backend exposes its handles so an
     // mtmd context opens on the SAME loaded model; the persistent KV lives in m_ctx, so
     // vision prefill + text decode share one context (no second session resident).
-    void* llama_model_ptr() override { return m_model.get(); }
-    void* llama_context_ptr() override { return m_ctx.get(); }
+    void* llama_model_ptr() override {
+        return m_model.get();
+    }
+    void* llama_context_ptr() override {
+        return m_ctx.get();
+    }
+    std::string mmproj_path() const override {
+        return m_mmproj_path;
+    }
+
+    bool prepare_multimodal(std::string* err) override {
+        ++m_kv_revision;
+        if (!ensure_ctx(err))
+            return false;
+        m_multimodal_pending = true;
+        m_kv_tokens.clear();
+        m_sampler.reset();
+        llama_memory_clear(llama_get_memory(m_ctx.get()), true);
+        return true;
+    }
 
     // Lazy context creation, shared by generate() and the state-file entry
     // points (#170b needs a context before the first turn). Returns false and
@@ -545,9 +566,23 @@ class LlamaSession final : public Session {
     InferenceResult generate(const GenerateParams& gp) override {
         InferenceResult res;
 
+        ++m_kv_revision;
         if (!ensure_ctx(&res.error_msg))
             return res;
         llama_context* ctx = m_ctx.get();
+
+        // An abandoned prefill (for example a disconnected SSE header) must
+        // never become a text-only continuation. Require the complete prompt.
+        if (m_multimodal_pending) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            m_kv_tokens.clear();
+            m_sampler.reset();
+            if (gp.reuse_kv && !gp.reset_kv) {
+                res.error_msg = "multimodal KV requires a full text prompt";
+                return res;
+            }
+            m_multimodal_pending = false;
+        }
 
         // KV-cache reuse: a continuation turn (reuse_kv && !reset_kv) keeps the
         // existing cache and appends the delta; otherwise re-prefill the full
@@ -792,14 +827,16 @@ class LlamaSession final : public Session {
         res.ended_with_stop = stopped_by_seq;
         res.n_drafted = dlr.n_drafted;
         res.n_spec_accepted = dlr.n_accepted;
-        if (dlr.rewind_failed) {
+        if (dlr.rewind_failed || dlr.decode_failed) {
             // History and KV are untrustworthy — same class as a decode failure.
             m_kv_tokens.clear();
             if (m_ctx)
                 llama_memory_clear(llama_get_memory(m_ctx.get()), /*data=*/true);
             res.success = false;
             res.error_msg =
-                "speculative KV rewind unsupported (disable prompt_lookup for this model)";
+                dlr.decode_failed
+                    ? "token decode failed"
+                    : "speculative KV rewind unsupported (disable prompt_lookup for this model)";
             log_output(("[xllama] " + res.error_msg + "\n").c_str());
             return res;
         }
@@ -826,53 +863,66 @@ class LlamaSession final : public Session {
     // boundary; m_kv_tokens is cleared after so no later turn prefix-matches a KV whose
     // text record we cannot reconstruct (the API already forces a full re-prefill whenever
     // images are present, so this only guards the mixed case).
-    InferenceResult generate_from_prefilled(const GenerateParams& gp) override {
+    InferenceResult generate_from_prefilled(const GenerateParams& gp,
+                                            const PrefilledContext& prefill) override {
+        ++m_kv_revision;
         InferenceResult res;
-        if (!ensure_ctx(&res.error_msg))
+        if (!m_ctx || !m_multimodal_pending) {
+            res.error_msg = "multimodal context has not been prepared";
             return res;
+        }
+        // External embeddings cannot be represented by m_kv_tokens. Discard them
+        // on every exit, including exceptions, and require a complete next prompt.
+        struct Cleanup {
+            LlamaSession& session;
+            ~Cleanup() {
+                llama_memory_clear(llama_get_memory(session.m_ctx.get()), true);
+                session.m_kv_tokens.clear();
+                session.m_sampler.reset();
+                session.m_multimodal_pending = true;
+            }
+        } cleanup{*this};
         llama_context* ctx = m_ctx.get();
-        const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
-        llama_memory_t mem = llama_get_memory(ctx);
-        // Where mtmd left the cache. seq_pos_max is -1 on an empty cache → 0.
-        const int kv_len = static_cast<int>(llama_memory_seq_pos_max(mem, 0)) + 1;
-        if (kv_len <= 0) {
-            res.error_msg = "prefill-continue called with an empty context";
+        const int capacity = static_cast<int>(llama_n_ctx(ctx));
+        if (prefill.n_tokens <= 0 || prefill.n_tokens >= capacity || prefill.next_position <= 0 ||
+            llama_memory_seq_pos_max(llama_get_memory(ctx), 0) < 0 || !llama_get_logits(ctx)) {
+            res.error_msg = "invalid or empty multimodal prefill";
             return res;
         }
-        const SamplingConfig sc = gp.sampling();
-        if (!m_sampler || !same_chain(m_sampler_cfg, sc)) {
-            const llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
-            m_sampler.reset(llama_sampler_chain_init(sparams));
-            add_sampler_stages(m_sampler.get(), sc, vocab);
-            m_sampler_cfg = sc;
+        const llama_vocab* vocab = llama_model_get_vocab(m_model.get());
+        m_sampler.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        if (!m_sampler) {
+            res.error_msg = "failed to create multimodal sampler";
+            return res;
         }
+        add_sampler_stages(m_sampler.get(), gp.sampling(), vocab);
+        m_sampler_cfg = gp.sampling();
         DecodeLoopParams dlp;
         dlp.ctx = ctx;
         dlp.sampler = m_sampler.get();
         dlp.vocab = vocab;
-        dlp.n_predict = std::max(0, std::min(gp.n_predict, m_n_ctx - kv_len)); // n_pf == 0
+        dlp.n_predict = std::max(0, std::min(gp.n_predict, capacity - prefill.n_tokens));
+        dlp.next_position = prefill.next_position;
         dlp.stop_sequences = &gp.stop_sequences;
         dlp.abort_flag = gp.abort_flag;
         dlp.on_token = gp.on_token;
-        dlp.on_accepted = nullptr;      // image-token positions not enumerable as text ids
-        dlp.prompt_lookup = false;      // no reliable n-gram history across the media boundary
+        // No text tokenization, prompt evaluation, or prompt-lookup speculation.
+        const auto start = std::chrono::steady_clock::now();
         const DecodeLoopResult dlr = decode_loop(dlp, res.output_text);
+        res.t_eval_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                .count();
+        res.n_p_eval = prefill.n_tokens;
+        res.t_p_eval_ms = prefill.prefill_ms;
         res.n_eval = dlr.n_generated;
         res.ended_with_stop = dlr.ended_with_stop;
-        res.n_drafted = dlr.n_drafted;
-        res.n_spec_accepted = dlr.n_accepted;
-        if (dlr.rewind_failed) {
-            m_kv_tokens.clear();
-            llama_memory_clear(mem, /*data=*/true);
-            res.success = false;
-            res.error_msg = "speculative KV rewind unsupported (disable prompt_lookup)";
-            return res;
-        }
-        // Text-token record cannot span the image boundary; force a clean full re-prefill
-        // next turn rather than prefix-matching against an incomplete record.
-        m_kv_tokens.clear();
-        res.success = true;
-        log_output("[xllama] session generate: multimodal continue-from-prefilled (no re-prefill)\n");
+        res.success =
+            !dlr.decode_failed && !dlr.rewind_failed && !(gp.abort_flag && gp.abort_flag->load());
+        if (!res.success)
+            res.error_msg =
+                dlr.decode_failed ? "multimodal token decode failed" : "generation aborted";
+        log_output(
+            "[xllama] session generate: multimodal continue-from-prefilled (no re-prefill)\n");
         return res;
     }
 
@@ -1014,6 +1064,7 @@ class LlamaSession final : public Session {
     }
 
     bool load_state(const std::string& path, std::string* err) override {
+        ++m_kv_revision;
         if (!ensure_ctx(err))
             return false;
         FILE* fp = open_state_file(path, "rb");
@@ -1107,6 +1158,7 @@ class LlamaSession final : public Session {
             return false;
         }
         m_kv_tokens = std::move(tokens);
+        m_multimodal_pending = false;
         char lb[160];
         snprintf(lb, sizeof(lb),
                  "[xllama] session: KV state loaded — %zu tokens, %.1f MB (#170b)\n",
@@ -1159,9 +1211,10 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
     int n_threads = sp.n_threads > 0 ? sp.n_threads : detect_threads_llama();
     int n_ctx = sp.n_ctx > 0 ? sp.n_ctx : kDefaultNCtx;
     log_output("[xllama] Session: GGUF model loaded via llama.cpp (persistent)\n");
-    return std::make_unique<LlamaSession>(LlamaModelPtr(raw_model), std::move(adapter),
-                                          sp.lora_scale, n_ctx, n_threads, sp.n_batch, sp.n_ubatch,
-                                          sp.kv_q8, sp.prompt_lookup);
+    return std::make_unique<LlamaSession>(
+        LlamaModelPtr(raw_model), std::move(adapter), sp.lora_scale, n_ctx, n_threads, sp.n_batch,
+        sp.n_ubatch, sp.kv_q8, sp.prompt_lookup,
+        sp.mmproj_path.empty() ? find_mmproj_in_dir(abs_path) : resolve_model_path(sp.mmproj_path));
 }
 } // namespace detail
 

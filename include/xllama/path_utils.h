@@ -40,4 +40,8 @@ bool model_uses_llama_backend(const std::string& model_id);
 // otherwise pick adapter.gguf before model.gguf).
 std::string first_gguf_in_dir(const std::string& path, const std::string& exclude_filename = {});
 
+// Find the multimodal projector *.gguf file in the model directory (containing "mmproj").
+// Empty string if not found.
+std::string find_mmproj_in_dir(const std::string& path);
+
 } // namespace xllama

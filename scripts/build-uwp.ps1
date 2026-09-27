@@ -23,12 +23,12 @@ param(
     [string]$Configuration  = "Release",
     [string]$Platform       = "x64",
     [switch]$ForceNewCert   = $false,
-    # 'ort' (default): ORT GenAI only. 'llamacpp': ggml/llama CPU backend only
-    # (XLLAMA_USE_ORT absent). 'unified': BOTH backends compiled, chosen at
+    # 'ort': ORT GenAI only. 'llamacpp': ggml/llama CPU backend only
+    # (XLLAMA_USE_ORT absent). 'unified' (default): BOTH backends compiled, chosen at
     # runtime per model (Qwen3.5/LFM2 GGUF via llama.cpp, rest via ORT).
     # 'llamacpp'/'unified' require the submodule + scripts/apply-uwp-patches.sh.
     [ValidateSet("ort", "llamacpp", "unified")]
-    [string]$Backend        = "ort",
+    [string]$Backend        = "unified",
     # Replace onnxruntime-genai.dll with the #2280 DML fallback build when available
     # (vendor/onnxruntime-genai-patched/ or -Build via vendor-genai-dml-patch.ps1).
     [switch]$PatchedGenAI   = $false,
@@ -56,7 +56,7 @@ $PfxPath  = Join-Path $RepoRoot "uwp\xllama-test.pfx"
 $CerPath  = Join-Path $RepoRoot "uwp\xllama-test.cer"
 $CertPwd  = "xllama-test"
 
-if (-not $IsWindows) {
+if ($env:OS -ne 'Windows_NT') {
     Write-Error "UWP packaging requires Windows with Visual Studio 2022, the UWP workload, and Windows SDK tools."
     exit 1
 }
@@ -65,6 +65,21 @@ if (-not (Test-Path $SlnPath)) {
     Write-Error "Solution file not found: $SlnPath"
     exit 1
 }
+
+# Verify the build contract and toolchain before creating signing artifacts.
+if ($Backend -ne 'ort') {
+    & (Join-Path $PSScriptRoot 'check-uwp-vision.ps1')
+}
+$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $VsWhere)) {
+    throw 'vswhere.exe not found. Install Visual Studio 2022 with the C++ UWP workload and Windows SDK 22621.'
+}
+$MsBuild = & $VsWhere -latest -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.ComponentGroup.UWP.VC `
+    -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
+if (-not $MsBuild) {
+    throw 'MSBuild with C++ UWP support not found via vswhere.'
+}
+Write-Host "Using MSBuild: $MsBuild"
 
 # ---------------------------------------------------------------------------
 # Certificate handling: reuse existing cert unless -ForceNewCert is passed.
@@ -101,25 +116,6 @@ Write-Host "PFX: $PfxPath"
 Write-Host "CER: $CerPath"
 
 # ---------------------------------------------------------------------------
-# Locate MSBuild
-# ---------------------------------------------------------------------------
-$VsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-if (-not (Test-Path $VsWhere)) {
-    Write-Error "vswhere.exe not found. Install Visual Studio 2022 with UWP workload."
-    exit 1
-}
-
-$MsBuild = & $VsWhere -latest -requires Microsoft.Component.MSBuild `
-    -find MSBuild\**\Bin\MSBuild.exe | Select-Object -First 1
-
-if (-not $MsBuild) {
-    Write-Error "MSBuild not found via vswhere."
-    exit 1
-}
-
-Write-Host "Using MSBuild: $MsBuild"
-
-# ---------------------------------------------------------------------------
 # Copy VC++ CRT DLLs for onnxruntime AppContainer compatibility.
 # onnxruntime.dll and onnxruntime-genai.dll are built with the desktop /MD
 # runtime and import MSVCP140.dll (not MSVCP140_APP.dll). On Xbox AppContainer,
@@ -151,6 +147,9 @@ if ($CrtRedistDir) {
 # ---------------------------------------------------------------------------
 Write-Host "Restoring NuGet packages ..."
 nuget restore $SlnPath
+if ($LASTEXITCODE -ne 0) {
+    throw "NuGet restore failed ($LASTEXITCODE)."
+}
 
 if ($PatchedGenAI -and $Backend -ne "llamacpp") {
     $VendorScript = Join-Path $RepoRoot "scripts/vendor-genai-dml-patch.ps1"
@@ -220,6 +219,7 @@ $MsBuildArgs = @(
     $SlnPath,
     "/p:Configuration=$Configuration",
     "/p:Platform=$Platform",
+    "/p:XllamaBackend=$Backend",
     "/p:AppxPackageSigningEnabled=true",
     "/p:PackageCertificateKeyFile=$PfxPath",
     "/p:PackageCertificatePassword=$CertPwd",
@@ -232,7 +232,6 @@ if ($StoreSku) {
 }
 if ($Backend -ne "ort") {
     Write-Host "Backend: $Backend (links the static ggml/llama lib)"
-    $MsBuildArgs += "/p:XllamaBackend=$Backend"
     # Pre-build the static ggml/llama lib explicitly: the solution maps it
     # ActiveCfg-only (no Build.0 — the ORT variants must not compile it, the
     # submodule may be absent there), so the solution build resolves the

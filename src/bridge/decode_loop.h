@@ -83,6 +83,10 @@ struct DecodeLoopParams {
     // prefix diff and the #170b snapshot fingerprint both read.
     std::function<void(llama_token)> on_accepted;
 
+    // External multimodal prefill reports the next temporal position separately
+    // from the number of occupied KV cells. -1 keeps the normal text fast path.
+    llama_pos next_position = -1;
+
     // Phase 15 W2 (#210): draft-free prompt-lookup speculative decoding.
     // Default OFF. Requires token_history seeded with the prefill tokens.
     // History ownership: when on_accepted is set it must update the same
@@ -104,6 +108,7 @@ struct DecodeLoopResult {
     // batch. Callers must treat the generation as failed and drop the KV —
     // continuing would desync history from cells (hybrid/LFM caches).
     bool rewind_failed = false;
+    bool decode_failed = false;
 };
 
 namespace detail {
@@ -135,8 +140,12 @@ inline void accept_token(const DecodeLoopParams& p, llama_token token) {
 }
 
 // Decode one already-sampled token (classic path).
-inline bool decode_one(llama_context* ctx, llama_token token) {
+inline bool decode_one(llama_context* ctx, llama_token token, llama_pos position = -1) {
     llama_batch next = llama_batch_get_one(&token, 1);
+    // The pinned llama batch allocator broadcasts scalar text positions across
+    // all M-RoPE axes; only image embedding batches require four position arrays.
+    if (position >= 0)
+        next.pos = &position;
     return llama_decode(ctx, next) == 0;
 }
 
@@ -199,9 +208,11 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
         log_output("[xllama] stop sequence after " + std::to_string(out.n_generated) + " tokens\n");
         return false;
     }
-    if (!decode_one(p.ctx, token)) {
+    const llama_pos position = p.next_position < 0 ? -1 : p.next_position + out.n_generated;
+    if (!decode_one(p.ctx, token, position)) {
         log_output("[xllama] decode failed at token, stopping generation\n");
         decode_ok = false;
+        out.decode_failed = true;
         return false;
     }
     accept_token(p, token);
@@ -231,7 +242,8 @@ inline bool classic_step(const DecodeLoopParams& p, llama_token token, std::stri
 // single-token decode of lead on this stack. Commit lead first, then speculate.
 inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& output_text) {
     DecodeLoopResult out;
-    bool spec_enabled = p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0;
+    bool spec_enabled =
+        p.prompt_lookup && p.token_history != nullptr && p.spec_k > 0 && p.next_position < 0;
 
     while (out.n_generated < p.n_predict) {
         if (p.abort_flag && p.abort_flag->load())
@@ -390,6 +402,7 @@ inline DecodeLoopResult decode_loop(const DecodeLoopParams& p, std::string& outp
             // cand is not yet in the KV (only accepted drafts are).
             if (!detail::decode_one(p.ctx, cand)) {
                 log_output("[xllama] decode failed after speculative reject\n");
+                out.decode_failed = true;
                 stop_all = true;
                 break;
             }

@@ -55,7 +55,7 @@ this is Dev Mode research, not a hosted service.
 | `GET`     | `/` or `/health`         | `200 {"status":"ok","service":"xllama"}` — the spike/liveness probe.                                                                              |
 | `GET`     | `/v1/models`             | OpenAI model discovery — every servable on-device model; non-standard `"active": true` marks the one currently loaded.                            |
 | `GET`     | `/api/tags`              | Ollama model discovery — same list, Ollama shape.                                                                                                 |
-| `POST`    | `/v1/chat/completions`   | OpenAI-compatible chat completion, **non-streaming**.                                                                                             |
+| `POST`    | `/v1/chat/completions`   | OpenAI-compatible chat completion, JSON or SSE; ordered image input with mtmd.                                                                    |
 | `POST`    | `/v1/preferences`        | Append a preference sample (`label` + `messages[]`) to `training/samples.jsonl` — same contract as the UI rate op (#118).                         |
 | `GET`     | `/v1/training/status`    | `result.done` / `progress.json` / last personalized `result.json` + usable sample count (#118).                                                   |
 | `POST`    | `/v1/images/generations` | SD-Turbo image gen (`prompt`, `steps` 1–4, `seed`); returns OpenAI-ish `{data:[{b64_json,path}]}` (#118). Shares the single-slot mutex with chat. |
@@ -97,8 +97,80 @@ The reply follows the OpenAI shape: `id` (unique `chatcmpl-…`), `object: chat.
 cap is hit, else `stop`; and `logprobs: null`, omitting which breaks openai-python/LangChain
 Pydantic validation), and a `usage` block from `InferenceResult` (`n_p_eval` / `n_eval`).
 
-`stream: true` is **not** implemented in v1 (always returns the full completion). The
-`GenerateParams::on_token` hook is the seam for adding SSE later.
+`stream: true` returns HTTP chunked `text/event-stream`, without `Content-Length`.
+The first event announces the assistant role; subsequent deltas contain generated
+content, followed by `finish_reason` and `data: [DONE]`. UTF-8 fragments and split
+stop sequences are assembled before JSON framing. A bounded producer queue feeds
+one persistent WinRT writer; the inference thread performs no socket writes.
+Overflow and socket failure abort the stream, and the producer is always joined.
+
+Text continuation requires the same model, settings, system/history prefix,
+session generation and KV revision. A GUI turn or state restore invalidates the
+API's revision. Failed requests cannot commit a reusable prefix. Requests carrying
+images always reset and evaluate their entire ordered prompt; image contexts are
+cleared after generation.
+
+### Native image input
+
+Send `content` arrays with `text` and `image_url` parts in **user** messages. The
+sequence `text A, image 1, text B, image 2` remains in that order through rendering,
+mtmd tokenization and bitmap evaluation. Data URLs must be base64 PNG, JPEG or GIF,
+with matching MIME/magic bytes. Remote URLs, WebP (unsupported by this pin's
+stb_image decoder), malformed payloads and oversize input return an error; images
+are never silently discarded. Limits: 16 MiB compressed per image, 32 MiB total,
+48 MiB HTTP body including base64 and JSON. Literal mtmd media markers in an image
+request's text are rejected.
+
+```json
+{
+  "model": "qwen25-vl-3b",
+  "stream": true,
+  "vision_preset": "fast",
+  "max_tokens": 256,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        { "type": "text", "text": "What is in this image?" },
+        {
+          "type": "image_url",
+          "image_url": { "url": "data:image/jpeg;base64,..." }
+        }
+      ]
+    }
+  ]
+}
+```
+
+`vision_preset` accepts `fast` (256�1024 visual tokens) or `detailed` (1024�4096).
+These set mtmd's `image_min_tokens`/`image_max_tokens`; there is no manual resize
+preset. If omitted, `LocalState\vision-preset.txt` containing `1` selects Detailed,
+otherwise Fast. The projector opens for each image request, so preset changes take
+effect immediately; projector load time is included in client TTFT. Text-only
+requests never open it. A future projector cache must have session-owned lifetime.
+
+Image prompts use the actual mtmd chunk token count for context capacity. They are
+rejected when prompt plus requested reply cannot fit; history is never trimmed
+independently of its bitmaps. Use the model's catalogue `n_ctx` policy to reserve
+space (8192 for initial Detailed experiments; memory suitability needs console
+measurement). The default context is 2048 and may reject Detailed or multi-image
+requests.
+
+Exactly-once path: `prepare_multimodal` creates/clears the shared llama context;
+`mtmd_helper_eval_chunks(..., logits_last=true)` evaluates it once;
+`generate_from_prefilled(gp, PrefilledContext)` samples from those logits. Occupied
+KV token count and next M-RoPE position are separate values. No prompt re-tokenizing
+or second prefill occurs. No second language model or Session is loaded.
+
+Provisioning, build handoff and the Series X measurement checklist are in
+[multimodal validation](multimodal-validation.md).
+
+For Open WebUI on the PC, configure its OpenAI-compatible connection URL as
+`http://<xbox-ip>:11434/v1`, and select the provisioned model from `/v1/models`.
+The PC must be able to reach the Xbox directly, including from its container if
+Open WebUI runs in Docker. Use data-URL image uploads. Phones/notebooks connect to
+Open WebUI on the PC; the Xbox endpoint stays on the LAN. End-to-end Open WebUI
+compatibility still needs this console validation.
 
 ### Preferences (`POST /v1/preferences`)
 
