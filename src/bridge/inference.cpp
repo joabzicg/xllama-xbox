@@ -363,6 +363,7 @@ InferenceResult run_inference_ort(const InferenceParams& params) {
 
     #include "decode_loop.h"
     #include "sampler_chain.h" // shared sampler chain (#125); needs llama.h
+    #include "xllama/llama_load_diag.h" // load-failure diagnostics (log forwarding, file check)
     #include "xllama/llama_raii.h"
 
     #include <vector>
@@ -387,15 +388,39 @@ InferenceResult run_inference_llama(const InferenceParams& params) {
         return res;
     }
 
+    // #load-fail diagnostics: same pattern as the session path - forward
+    // llama.cpp logs (global callback, installed once), check the file on
+    // disk, snapshot memory, capture the loader's WARN/ERROR lines.
+    load_diag::install_log_forwarding();
+    const auto fc = load_diag::check_model_file(abs_model_path);
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0; // CPU only on Linux path
+    load_diag::log_model_params("before model load", mparams);
+    load_diag::log_memory_snapshot("before model load");
 
     if (params.on_status)
         params.on_status("loading model");
 
-    llama_model* raw_model = llama_model_load_from_file(abs_model_path.c_str(), mparams);
+    llama_model* raw_model = nullptr;
+    {
+        load_diag::LoadWindow win; // gates INFO/CONT, captures this load's WARN/ERROR
+        raw_model = llama_model_load_from_file(abs_model_path.c_str(), mparams);
+    }
     if (!raw_model) {
+        load_diag::log_memory_snapshot("after model load FAILED");
+        std::string reason = load_diag::window_text();
+        if (reason.empty())
+            reason = load_diag::last_error();
+        while (!reason.empty() && (reason.back() == '\n' || reason.back() == '\r'))
+            reason.pop_back();
         res.error_msg = "failed to load model: " + abs_model_path;
+        if (reason.empty())
+            res.error_msg += " [no llama.cpp diagnostic captured]";
+        else
+            res.error_msg += " | llama.cpp: " + reason;
+        if (!fc.opened)
+            res.error_msg += " | file check: " + fc.detail;
         log_output("[xllama] " + res.error_msg + "\n");
         if (params.on_status)
             params.on_status("error: " + res.error_msg);

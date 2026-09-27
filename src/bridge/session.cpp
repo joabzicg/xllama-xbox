@@ -408,6 +408,7 @@ std::unique_ptr<Session> create_ort(const SessionParams& sp, std::string* err) {
 
     #include "decode_loop.h"   // shared prefill + generation loops; needs llama.h
     #include "sampler_chain.h" // shared sampler chain (#125); needs llama.h
+    #include "xllama/llama_load_diag.h" // load-failure diagnostics (log forwarding, file check)
     #include "xllama/llama_raii.h"
 
     #include <vector>
@@ -416,6 +417,16 @@ namespace xllama {
 
 class LlamaSession final : public Session {
   public:
+    // #load-fail diagnostics: release evidence. Runs before the RAII members
+    // (adapter, model, ctx) are destroyed, so the pointers shown are exactly
+    // what is about to be released.
+    ~LlamaSession() override {
+        char b[160];
+        snprintf(b, sizeof(b), "[xllama] LlamaSession destroyed (model=%p adapter=%p ctx=%p)\n",
+                 (void*)m_model.get(), (void*)m_adapter.get(), (void*)m_ctx.get());
+        log_output(b);
+    }
+
     LlamaModelPtr m_model;
     LlamaAdapterLoraPtr m_adapter; // optional runtime LoRA (freed before model)
     float m_lora_scale = 1.0f;
@@ -1185,13 +1196,41 @@ std::unique_ptr<Session> create_llama(const SessionParams& sp, std::string* err)
         return nullptr;
     }
 
+    // #load-fail diagnostics: forward llama.cpp logs into xllama.log (global
+    // callback, installed once), check the file on disk, snapshot memory, then
+    // load inside a window that captures the loader's WARN/ERROR lines so a
+    // failure carries the PRECISE reason instead of just the path.
+    load_diag::install_log_forwarding();
+    const auto fc = load_diag::check_model_file(abs_path);
+
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = sp.n_gpu_layers;
+    load_diag::log_model_params("before model load", mparams);
+    load_diag::log_memory_snapshot("before model load");
 
-    llama_model* raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);
+    llama_model* raw_model = nullptr;
+    {
+        load_diag::LoadWindow win; // gates INFO/CONT, captures this load's WARN/ERROR
+        raw_model = llama_model_load_from_file(abs_path.c_str(), mparams);
+    }
     if (!raw_model) {
+        load_diag::log_memory_snapshot("after model load FAILED");
+        std::string reason = load_diag::window_text();
+        if (reason.empty())
+            reason = load_diag::last_error();
+        // Trim trailing newlines from the captured loader text.
+        while (!reason.empty() && (reason.back() == '\n' || reason.back() == '\r'))
+            reason.pop_back();
+        std::string msg = "failed to load model: " + abs_path;
+        if (reason.empty())
+            msg += " [no llama.cpp diagnostic captured]";
+        else
+            msg += " | llama.cpp: " + reason;
+        if (!fc.opened)
+            msg += " | file check: " + fc.detail;
+        log_output(("[xllama] " + msg + "\n").c_str());
         if (err)
-            *err = "failed to load model: " + abs_path;
+            *err = msg;
         return nullptr;
     }
 

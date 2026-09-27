@@ -27,6 +27,7 @@
 //     turns.
 #pragma once
 
+#include "xllama/platform.h" // log_output (release diagnostics)
 #include "xllama/session.h"
 
 #include <atomic>
@@ -61,7 +62,16 @@ struct SessionHub {
                            std::string* err = nullptr) {
         if (session && model == model_id)
             return session.get();
+        // #load-fail diagnostics: release evidence for model switching - the
+        // old session is destroyed BEFORE the new one loads (never 2x in RAM).
+        const bool had_resident = session != nullptr;
+        if (had_resident)
+            log_output(("[xllama] hub: releasing resident session '" + model + "' before loading '"
+                        + model_id + "'\n").c_str());
         session.reset(); // release the old model before loading the new one
+        if (had_resident)
+            log_output(("[xllama] hub: previous session released, loading '" + model_id + "'\n")
+                           .c_str());
         model.clear();
         ++generation;
         auto s = Session::create(sp, err);
@@ -70,12 +80,15 @@ struct SessionHub {
         session = std::move(s);
         model = model_id;
         ++generation;
+        log_output(("[xllama] hub: resident session now '" + model_id + "'\n").c_str());
         return session.get();
     }
 
     // Under mtx: drop the resident session (e.g. to free RAM on demand).
     void reset_locked() {
         if (session) {
+            log_output(("[xllama] hub: releasing resident session '" + model + "' (reset)\n")
+                           .c_str());
             session.reset();
             model.clear();
             ++generation;
