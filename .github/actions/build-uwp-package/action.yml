@@ -32,6 +32,32 @@ runs:
         bash scripts/apply-uwp-patches.sh
         bash scripts/check-uwp-sources.sh
 
+    - name: Ensure Visual Studio 2022 C++ UWP toolchain
+      shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $required = @('Microsoft.Component.MSBuild', 'Microsoft.VisualStudio.ComponentGroup.UWP.VC')
+        $ready = & $vswhere -latest -version '[17.0,18.0)' -requires $required -property installationPath
+        if (-not $ready) {
+          # windows-2022 includes desktop v143 and older/ARM UWP components,
+          # but does not register the optional v143 C++ UWP component group.
+          $installation = & $vswhere -latest -version '[17.0,18.0)' `
+            -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $installation) { throw 'Visual Studio 2022 C++ installation not found.' }
+          $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $arguments = @('modify', '--installPath', "`"$installation`"", '--add',
+            'Microsoft.VisualStudio.ComponentGroup.UWP.VC', '--quiet', '--norestart')
+          $process = Start-Process -FilePath $setup -ArgumentList $arguments `
+            -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Installing the C++ UWP component failed ($($process.ExitCode))."
+          }
+          $ready = & $vswhere -latest -version '[17.0,18.0)' -requires $required -property installationPath
+          if (-not $ready) { throw 'C++ UWP component is still unavailable after installation.' }
+        }
+        Write-Host "C++ UWP toolchain ready: $ready"
+
     - name: Verify host streaming and vision contracts
       shell: pwsh
       run: |
